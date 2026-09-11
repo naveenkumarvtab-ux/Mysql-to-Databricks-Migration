@@ -1,4 +1,4 @@
-"""Run on the SQL Server network. No inbound listener or arbitrary SQL endpoint."""
+# Local connector agent for PostgreSQL / SQL Server data source introspection and streaming.
 import argparse
 from datetime import date, datetime, time as time_type
 from decimal import Decimal
@@ -16,18 +16,20 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
-from app.services.discovery import discover_sqlserver, test_sqlserver_connection, connection_diagnostic
+from app.services.discovery import (
+    discover_source,
+    test_source_connection,
+    connection_diagnostic,
+)
 from app.services.type_compatibility import source_select_expression
 
 
-def quoted(value):
+def quoted(value, is_postgres=True):
     if not isinstance(value, str) or not value or len(value) > 128 or "\x00" in value:
         raise ValueError("Invalid SQL identifier")
+    if is_postgres:
+        return '"' + value.replace('"', '""') + '"'
     return "[" + value.replace("]", "]]") + "]"
-
-
-def odbc_value(value):
-    return "{" + value.replace("}", "}}") + "}"
 
 
 def encode_value(value):
@@ -41,35 +43,44 @@ def encode_value(value):
         return {"kind": type(value).__name__, "value": value.isoformat()}
     if isinstance(value, UUID):
         return str(value)
+    if isinstance(value, (list, dict)):
+        return json.dumps(value)
     raise ValueError("Unsupported source value type")
 
 
 class LocalAgent:
-    def __init__(self, source_id, server, database, connection_string):
+    def __init__(self, source_id, server, database, connection_info, is_postgres=True):
         self.source_id, self.server, self.database = source_id, server, database
-        self.connection_string = connection_string
+        self.connection_info = connection_info
+        self.is_postgres = is_postgres
         self.streams = {}
 
     def connect(self):
-        import pyodbc
-        try:
-            conn = pyodbc.connect(self.connection_string, timeout=10, autocommit=True)
-            conn.timeout = 60
-            return conn
-        except pyodbc.Error as exc:
-            if "IM002" in str(exc):
-                installed = [d for d in pyodbc.drivers() if "SQL Server" in d]
-                for alt in ["ODBC Driver 17 for SQL Server", "ODBC Driver 18 for SQL Server", "SQL Server"]:
-                    if alt in installed and alt not in self.connection_string:
-                        alt_cs = re.sub(r"DRIVER=\{[^}]+\}", f"DRIVER={{{alt}}}", self.connection_string)
-                        try:
-                            conn = pyodbc.connect(alt_cs, timeout=10, autocommit=True)
-                            conn.timeout = 60
-                            self.connection_string = alt_cs
-                            return conn
-                        except Exception:
-                            continue
-            raise
+        if self.is_postgres:
+            import psycopg2
+            if isinstance(self.connection_info, dict):
+                return psycopg2.connect(**self.connection_info)
+            return psycopg2.connect(self.connection_info)
+        else:
+            import pyodbc
+            try:
+                conn = pyodbc.connect(self.connection_info, timeout=10, autocommit=True)
+                conn.timeout = 60
+                return conn
+            except pyodbc.Error as exc:
+                if "IM002" in str(exc):
+                    installed = [d for d in pyodbc.drivers() if "SQL Server" in d]
+                    for alt in ["ODBC Driver 17 for SQL Server", "ODBC Driver 18 for SQL Server", "SQL Server"]:
+                        if alt in installed and alt not in self.connection_info:
+                            alt_cs = re.sub(r"DRIVER=\{[^}]+\}", f"DRIVER={{{alt}}}", self.connection_info)
+                            try:
+                                conn = pyodbc.connect(alt_cs, timeout=10, autocommit=True)
+                                conn.timeout = 60
+                                self.connection_info = alt_cs
+                                return conn
+                            except Exception:
+                                continue
+                raise
 
     def cleanup(self, all_streams=False):
         for key, item in list(self.streams.items()):
@@ -86,9 +97,9 @@ class LocalAgent:
         op, data = task["operation"], task.get("payload", {})
         self.cleanup()
         if op == "test":
-            return test_sqlserver_connection(self.connection_string)
+            return test_source_connection(self.connection_info)
         if op == "discover":
-            return discover_sqlserver(self.connection_string)
+            return discover_source(self.connection_info)
         if op == "close":
             item = self.streams.pop(data.get("stream_id"), None)
             if item:
@@ -101,7 +112,6 @@ class LocalAgent:
             stream[2] = time.monotonic()
             size = min(max(int(data.get("size", 1000)), 1), 1000)
             rows, byte_count = [], 0
-            # Stop below the transport limit without skipping already fetched rows.
             for _ in range(size):
                 row = stream[3] if stream[3] is not None else stream[1].fetchone()
                 stream[3] = None
@@ -119,33 +129,74 @@ class LocalAgent:
             return {"rows": rows}
         if op not in {"count", "open"}:
             raise ValueError("Unsupported operation")
-        schema, table = data.get("schema"), data.get("table")
-        table_sql = quoted(schema) + "." + quoted(table)
+
+        schema, table = data.get("schema", "public"), data.get("table")
+        table_sql = f"{quoted(schema, self.is_postgres)}.{quoted(table, self.is_postgres)}"
         if len(self.streams) >= 4 and op == "open":
             raise ValueError("Connector stream capacity reached")
         conn = self.connect()
         try:
             cur = conn.cursor()
-            found = cur.execute("SELECT t.object_id FROM sys.tables t JOIN sys.schemas s ON s.schema_id=t.schema_id "
-                                "WHERE s.name=? AND t.name=? AND t.is_ms_shipped=0", schema, table).fetchone()
-            if not found:
-                raise ValueError("Source table not found or read permission missing")
-            if op == "count":
-                return {"count": int(cur.execute("SELECT COUNT_BIG(*) FROM " + table_sql).fetchone()[0])}
-            metadata = cur.execute("SELECT c.name, CASE WHEN t.is_user_defined=1 THEN TYPE_NAME(c.system_type_id) "
-                                   "ELSE t.name END, c.precision, c.scale FROM sys.columns c "
-                                   "JOIN sys.types t ON t.user_type_id=c.user_type_id "
-                                   "WHERE c.object_id=? AND c.is_computed=0", found[0]).fetchall()
-            columns = {r[0]: SimpleNamespace(column_name=r[0], data_type=r[1], precision=r[2], scale=r[3]) for r in metadata}
-            requested = data.get("columns")
-            if not isinstance(requested, list) or not requested or any(name not in columns for name in requested):
-                raise ValueError("Source columns changed; repeat discovery before deployment")
-            limit = data.get("max_rows")
-            if limit is not None and (type(limit) is not int or limit < 1):
-                raise ValueError("Invalid source row limit")
-            top = f"TOP ({limit}) " if limit is not None else ""
-            projection = ",".join(source_select_expression(columns[name]) for name in requested)
-            cur.execute("SELECT " + top + projection + " FROM " + table_sql)
+            if self.is_postgres:
+                cur.execute(
+                    "SELECT 1 FROM information_schema.tables WHERE table_schema=%s AND table_name=%s",
+                    (schema, table),
+                )
+                if not cur.fetchone():
+                    raise ValueError("Source table not found or read permission missing")
+                if op == "count":
+                    cur.execute(f"SELECT COUNT(*) FROM {table_sql}")
+                    return {"count": int(cur.fetchone()[0])}
+                cur.execute(
+                    "SELECT column_name, data_type, numeric_precision, numeric_scale "
+                    "FROM information_schema.columns WHERE table_schema=%s AND table_name=%s",
+                    (schema, table),
+                )
+                metadata = cur.fetchall()
+                columns = {
+                    r[0]: SimpleNamespace(
+                        column_name=r[0], data_type=r[1], precision=r[2], scale=r[3]
+                    )
+                    for r in metadata
+                }
+                requested = data.get("columns")
+                if not isinstance(requested, list) or not requested or any(name not in columns for name in requested):
+                    raise ValueError("Source columns changed; repeat discovery before deployment")
+                limit = data.get("max_rows")
+                limit_clause = f" LIMIT {int(limit)}" if limit is not None and isinstance(limit, int) and limit > 0 else ""
+                projection = ", ".join(source_select_expression(columns[name]) for name in requested)
+                cur.execute(f"SELECT {projection} FROM {table_sql}{limit_clause}")
+            else:
+                found = cur.execute(
+                    "SELECT t.object_id FROM sys.tables t JOIN sys.schemas s ON s.schema_id=t.schema_id "
+                    "WHERE s.name=? AND t.name=? AND t.is_ms_shipped=0",
+                    schema, table,
+                ).fetchone()
+                if not found:
+                    raise ValueError("Source table not found or read permission missing")
+                if op == "count":
+                    return {"count": int(cur.execute("SELECT COUNT_BIG(*) FROM " + table_sql).fetchone()[0])}
+                metadata = cur.execute(
+                    "SELECT c.name, CASE WHEN t.is_user_defined=1 THEN TYPE_NAME(c.system_type_id) "
+                    "ELSE t.name END, c.precision, c.scale FROM sys.columns c "
+                    "JOIN sys.types t ON t.user_type_id=c.user_type_id "
+                    "WHERE c.object_id=? AND c.is_computed=0",
+                    found[0],
+                ).fetchall()
+                columns = {
+                    r[0]: SimpleNamespace(
+                        column_name=r[0], data_type=r[1], precision=r[2], scale=r[3]
+                    )
+                    for r in metadata
+                }
+                requested = data.get("columns")
+                if not isinstance(requested, list) or not requested or any(name not in columns for name in requested):
+                    raise ValueError("Source columns changed; repeat discovery before deployment")
+                limit = data.get("max_rows")
+                top = f"TOP ({limit}) " if limit is not None else ""
+                projection = ",".join(source_select_expression(columns[name]) for name in requested)
+                cur.execute("SELECT " + top + projection + " FROM " + table_sql)
+
             stream_id = secrets.token_hex(24)
             self.streams[stream_id] = [conn, cur, time.monotonic(), None]
             conn = None
@@ -157,8 +208,8 @@ class LocalAgent:
 
 def validate_url(url):
     parts = urlsplit(url)
-    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password or parts.query or parts.fragment:
-        raise ValueError("Connector requires an HTTPS application URL without embedded credentials or query parameters")
+    if not parts.hostname or parts.username or parts.password or parts.query or parts.fragment:
+        raise ValueError("Connector requires an application URL without embedded credentials or query parameters")
     return url.rstrip("/") + "/api"
 
 
@@ -168,24 +219,49 @@ def main():
     parser.add_argument("--source", required=True)
     parser.add_argument("--server", required=True)
     parser.add_argument("--database", required=True)
-    parser.add_argument("--driver", default="ODBC Driver 17 for SQL Server")
-    parser.add_argument("--username", help="Omit to use the Windows account running this process")
+    parser.add_argument("--port", type=int, default=5432)
+    parser.add_argument("--sslmode", default="prefer")
+    parser.add_argument("--driver", default=None)
+    parser.add_argument("--username", default=None)
     parser.add_argument("--trust-server-certificate", action="store_true")
     args = parser.parse_args()
+
     base = validate_url(args.url)
     token = os.environ.get("CONNECTOR_TOKEN") or getpass.getpass("Connector registration token: ")
-    credentials = "Trusted_Connection=yes;"
-    if args.username:
-        password = os.environ.get("CONNECTOR_SQL_PASSWORD") or getpass.getpass("SQL Server password: ")
-        credentials = f"UID={odbc_value(args.username)};PWD={odbc_value(password)};"
-    connection = (f"DRIVER={odbc_value(args.driver)};SERVER={odbc_value(args.server)};"
-                  f"DATABASE={odbc_value(args.database)};{credentials}Encrypt=yes;"
-                  f"TrustServerCertificate={'yes' if args.trust_server_certificate else 'no'};")
-    agent = LocalAgent(args.source, args.server, args.database, connection)
+
+    is_postgres = args.driver is None or "sql server" not in args.driver.lower()
+    if is_postgres:
+        user = args.username or os.environ.get("POSTGRES_USERNAME") or "postgres"
+        password = os.environ.get("CONNECTOR_PG_PASSWORD") or os.environ.get("POSTGRES_PASSWORD")
+        if password is None:
+            password = getpass.getpass(f"PostgreSQL password for '{user}': ")
+        connection_info = {
+            "host": args.server,
+            "port": args.port,
+            "dbname": args.database,
+            "user": user,
+            "password": password,
+            "sslmode": args.sslmode,
+        }
+    else:
+        credentials = "Trusted_Connection=yes;"
+        if args.username:
+            password = os.environ.get("CONNECTOR_SQL_PASSWORD")
+            if password is None:
+                password = getpass.getpass("SQL Server password: ")
+            credentials = f"UID={args.username};PWD={password};"
+        connection_info = (
+            f"DRIVER={{{args.driver}}};SERVER={{{args.server}}};"
+            f"DATABASE={{{args.database}}};{credentials}Encrypt=yes;"
+            f"TrustServerCertificate={'yes' if args.trust_server_certificate else 'no'};"
+        )
+
+    agent = LocalAgent(args.source, args.server, args.database, connection_info, is_postgres=is_postgres)
     import httpx
     stopped = threading.Event()
     instance_id = secrets.token_hex(16)
-    print("Connector started. Keep this process running; SQL credentials stay on this machine.")
+    db_type = "PostgreSQL" if is_postgres else "SQL Server"
+    print(f"{db_type} connector started. Keep this process running; database credentials stay on this machine.")
     try:
         with httpx.Client(headers={"Authorization": "Bearer " + token, "X-Connector-Instance": instance_id}, timeout=30, follow_redirects=False) as client:
             def keep_alive():
@@ -215,11 +291,9 @@ def main():
                                 raise ValueError("Result exceeds connector payload limit; reduce the source scope")
                         except Exception as error:
                             ok = False
-                            # Locally generated validation messages contain no SQL credentials.
                             message = str(error) if isinstance(error, (ValueError, RuntimeError)) else connection_diagnostic(error)
                             result = {"error": message}
                         payload = {"lease": task["lease"], "ok": ok, "result": result}
-                        # Retry only delivery, never repeat a fetch that advanced a cursor.
                         for attempt in range(3):
                             try:
                                 reply = client.post(base + f"/connector/tasks/{task['id']}/result", json=payload)

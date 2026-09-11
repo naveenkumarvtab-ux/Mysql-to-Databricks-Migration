@@ -2,28 +2,71 @@ from __future__ import annotations
 import re
 
 TYPE_MAP = {
-    "bigint":"BIGINT", "int":"INT", "smallint":"SMALLINT", "tinyint":"SMALLINT",
-    "bit":"BOOLEAN", "float":"DOUBLE", "real":"FLOAT", "char":"STRING", "varchar":"STRING",
-    "varchar2":"STRING", "nvarchar2":"STRING", "clob":"STRING", "nclob":"STRING", "blob":"BINARY",
-    "text":"STRING", "nchar":"STRING", "nvarchar":"STRING", "ntext":"STRING", "date":"DATE",
-    "datetime":"TIMESTAMP", "datetime2":"TIMESTAMP", "smalldatetime":"TIMESTAMP",
-    "uniqueidentifier":"STRING", "binary":"BINARY", "varbinary":"BINARY", "image":"BINARY",
-    "xml":"STRING", "timestamp":"BINARY", "rowversion":"BINARY",
-    "datetimeoffset":"STRING", "sysname":"STRING", "hierarchyid":"STRING", "json":"STRING"
+    # SQL Server & PostgreSQL Integer Types
+    "bigint": "BIGINT", "int": "INT", "integer": "INT", "smallint": "SMALLINT", "tinyint": "SMALLINT",
+    "int2": "SMALLINT", "int4": "INT", "int8": "BIGINT",
+    "serial": "INT", "bigserial": "BIGINT", "smallserial": "SMALLINT",
+    "serial2": "SMALLINT", "serial4": "INT", "serial8": "BIGINT",
+
+    # Boolean Types
+    "bit": "BOOLEAN", "bool": "BOOLEAN", "boolean": "BOOLEAN",
+
+    # Floating point & numeric
+    "float": "DOUBLE", "float4": "FLOAT", "float8": "DOUBLE", "real": "FLOAT",
+    "double precision": "DOUBLE", "double": "DOUBLE",
+
+    # Character & Text Types
+    "char": "STRING", "varchar": "STRING", "character varying": "STRING", "character": "STRING",
+    "varchar2": "STRING", "nvarchar2": "STRING", "clob": "STRING", "nclob": "STRING",
+    "text": "STRING", "nchar": "STRING", "nvarchar": "STRING", "ntext": "STRING",
+    "citext": "STRING", "name": "STRING", "bpchar": "STRING",
+
+    # Binary types
+    "blob": "BINARY", "binary": "BINARY", "varbinary": "BINARY", "image": "BINARY",
+    "bytea": "BINARY", "timestamp": "BINARY", "rowversion": "BINARY",
+
+    # Date & Time types
+    "date": "DATE", "datetime": "TIMESTAMP", "datetime2": "TIMESTAMP", "smalldatetime": "TIMESTAMP",
+    "timestamptz": "TIMESTAMP", "timestamp with time zone": "TIMESTAMP",
+    "timestamp without time zone": "TIMESTAMP",
+    "time": "STRING", "timetz": "STRING", "time with time zone": "STRING",
+    "time without time zone": "STRING", "interval": "STRING",
+
+    # Specialized / Semi-structured types
+    "uniqueidentifier": "STRING", "uuid": "STRING",
+    "json": "STRING", "jsonb": "STRING",
+    "xml": "STRING", "datetimeoffset": "STRING", "sysname": "STRING", "hierarchyid": "STRING",
+    "inet": "STRING", "cidr": "STRING", "macaddr": "STRING", "macaddr8": "STRING",
+    "tsvector": "STRING", "tsquery": "STRING", "point": "STRING", "line": "STRING",
+    "lseg": "STRING", "box": "STRING", "path": "STRING", "polygon": "STRING", "circle": "STRING"
 }
 
-def map_sqlserver_type(name: str, precision: int|None=None, scale: int|None=None) -> str:
-    raw = name.lower().strip().replace("[", "").replace("]", "")
-    declared = re.fullmatch(r"([a-z0-9_]+)\s*\(\s*(max|\d+)\s*(?:,\s*(\d+)\s*)?\)", raw)
-    n = declared.group(1) if declared else raw
-    if n in {"decimal","numeric","number"}:
+def map_postgres_type(name: str, precision: int | None = None, scale: int | None = None) -> str:
+    raw = name.lower().strip().replace('"', '')
+    if raw.endswith("[]") or (raw.startswith("_") and len(raw) > 1):
+        base = raw[:-2] if raw.endswith("[]") else raw[1:]
+        base_mapped = map_postgres_type(base)
+        return f"ARRAY<{base_mapped}>"
+    raw = raw.replace('[', '').replace(']', '')
+    declared = re.fullmatch(r"([a-z0-9_ ]+)\s*\(\s*(max|\d+)\s*(?:,\s*(\d+)\s*)?\)", raw)
+    n = declared.group(1).strip() if declared else raw
+    if n in {"decimal", "numeric", "number"}:
         declared_precision = int(declared.group(2)) if declared and declared.group(2).isdigit() else None
         declared_scale = int(declared.group(3)) if declared and declared.group(3) else None
         return f"DECIMAL({precision or declared_precision or 38},{scale if scale is not None else (declared_scale or 0)})"
-    if n in {"money","smallmoney"}: return "DECIMAL(19,4)"
-    if n == "time": return "STRING"
-    if n in {"sql_variant","geography","geometry"}: return "STRING"
+    if n in {"money", "smallmoney"}:
+        return "DECIMAL(19,4)"
+    if n in {"time", "timetz", "time with time zone", "time without time zone", "interval"}:
+        return "STRING"
+    if n in {"sql_variant", "geography", "geometry"}:
+        return "STRING"
     return TYPE_MAP.get(n, "STRING")
+
+def map_sqlserver_type(name: str, precision: int | None = None, scale: int | None = None) -> str:
+    return map_postgres_type(name, precision, scale)
+
+def map_source_type(name: str, precision: int | None = None, scale: int | None = None) -> str:
+    return map_postgres_type(name, precision, scale)
 
 def classify_layer(object_type: str, definition: str|None="", name: str="") -> tuple[str,float,str]:
     t = object_type.upper(); d=(definition or "").lower(); n=name.lower()
@@ -236,5 +279,36 @@ def rewrite_common_tsql(sql: str) -> str:
     out = re.sub(r"\[([^\]]+)\]", r"`\1`", out)
     out = re.sub(r"\bTOP\s*\(?(\d+)\)?\s+", "", out, flags=re.I)
     return out
+
+
+def rewrite_common_postgres(sql: str) -> str:
+    """Rewrite PostgreSQL specific SQL syntax to standard Databricks SQL."""
+    if not sql:
+        return sql
+    out = rewrite_recursive_cte(sql)
+    # Convert now() / current_timestamp to Databricks current_timestamp()
+    out = re.sub(r"\bNOW\s*\(\s*\)", "current_timestamp()", out, flags=re.I)
+    # Double quoted identifiers "my_col" -> `my_col`
+    out = re.sub(r'"([^"]+)"', r"`\1`", out)
+    # Square bracket identifiers [my_col] -> `my_col`
+    out = re.sub(r"\[([^\]]+)\]", r"`\1`", out)
+    # Convert PostgreSQL string_agg(col, ',') -> array_join(collect_list(col), ',') or concat_ws
+    # Convert common PostgreSQL casts like ::text, ::int, ::timestamp
+    out = re.sub(r"::text\b", "", out, flags=re.I)
+    out = re.sub(r"::varchar\b", "", out, flags=re.I)
+    out = re.sub(r"::jsonb?\b", "", out, flags=re.I)
+    out = re.sub(r"::int(?:eger|4)?\b", "", out, flags=re.I)
+    out = re.sub(r"::bigint\b", "", out, flags=re.I)
+    out = re.sub(r"::timestamp\b", "", out, flags=re.I)
+    out = re.sub(r"::date\b", "", out, flags=re.I)
+    out = re.sub(r"::boolean?\b", "", out, flags=re.I)
+    # ILIKE is supported in modern Databricks, but LIKE LOWER(...) is also safe
+    return out
+
+
+def rewrite_source_sql(sql: str, source_type: str = "POSTGRESQL") -> str:
+    if source_type.upper() == "POSTGRESQL":
+        return rewrite_common_postgres(sql)
+    return rewrite_common_tsql(sql)
 
 

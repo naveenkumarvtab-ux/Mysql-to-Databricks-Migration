@@ -45,20 +45,20 @@ export default function SourceConnectorControl({ projectId, source }: Props) {
       setError(e instanceof Error ? e.message : "Connector update failed");
     } finally { setBusy(false); }
   };
-  const [driver, setDriver] = useState("ODBC Driver 17 for SQL Server");
-  const [trustCert, setTrustCert] = useState(true);
+  const [port, setPort] = useState("5432");
+  const [sslMode, setSslMode] = useState("prefer");
   const quote = (value: string) => "'" + value.replaceAll("'", "''") + "'";
-  const certificateOption = trustCert ? " --trust-server-certificate" : "";
-  const command = `python scripts/local_connector.py --url ${quote(window.location.origin)} --source ${quote(source.id)} --server ${quote(source.server_name)} --database ${quote(source.database_name)} --driver ${quote(driver)}${certificateOption}`;
+  const backendUrl = window.location.port === "5173" ? "http://127.0.0.1:8010" : window.location.origin;
+  const command = `python scripts/local_connector.py --url ${quote(backendUrl)} --source ${quote(source.id)} --server ${quote(source.server_name)} --database ${quote(source.database_name)} --port ${quote(port)} --sslmode ${quote(sslMode)}`;
 
   return <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
     <span>{status === "DIRECT" ? "Direct connection" : `Connector: ${status.toLowerCase()}`}</span>
     <button onClick={() => setOpen(true)}>Manage connector</button>
-    {open && <dialog ref={dialog} aria-label="Local SQL Server connector" onCancel={() => { setOpen(false); setRegistration(null); setError(""); }}
+    {open && <dialog ref={dialog} aria-label="Local PostgreSQL connector" onCancel={() => { setOpen(false); setRegistration(null); setError(""); }}
       style={{ border: "1px solid #d6dce5", borderRadius: 8, padding: 0, width: "min(680px, 90vw)", maxHeight: "85vh" }}>
       <div style={{ background: "white", color: "#172b4d", padding: 24, overflowY: "auto", whiteSpace: "normal" }}>
-        <h2>Local SQL Server connector</h2>
-        <p>Run the connector on a machine that can access {source.server_name}. It connects outward to this application over HTTPS. SQL credentials remain local.</p>
+        <h2>Local PostgreSQL connector</h2>
+        <p>Run the connector on a machine that can access {source.server_name}. It connects outward to this application over HTTPS. PostgreSQL credentials remain local.</p>
         <p>Status: <strong>{status}</strong></p>
         {error && <p role="alert">{error}</p>}
         {registration ? <>
@@ -66,20 +66,23 @@ export default function SourceConnectorControl({ projectId, source }: Props) {
           <textarea aria-label="Registration token" readOnly value={registration.token} rows={3} style={{ width: "100%", boxSizing: "border-box" }} />
           <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 16, margin: "14px 0 8px 0" }}>
             <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.9rem" }}>
-              <span><strong>ODBC Driver:</strong></span>
-              <select value={driver} onChange={(e) => setDriver(e.target.value)} style={{ padding: "4px 8px", borderRadius: 4, border: "1px solid #c1c7d0" }}>
-                <option value="ODBC Driver 17 for SQL Server">ODBC Driver 17 for SQL Server (Recommended)</option>
-                <option value="ODBC Driver 18 for SQL Server">ODBC Driver 18 for SQL Server</option>
+              <span><strong>Port:</strong></span>
+              <input value={port} onChange={(e) => setPort(e.target.value)} style={{ width: 80, padding: "4px 8px", borderRadius: 4, border: "1px solid #c1c7d0" }} />
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.9rem" }}>
+              <span><strong>SSL Mode:</strong></span>
+              <select value={sslMode} onChange={(e) => setSslMode(e.target.value)} style={{ padding: "4px 8px", borderRadius: 4, border: "1px solid #c1c7d0" }}>
+                <option value="prefer">prefer</option>
+                <option value="require">require</option>
+                <option value="disable">disable</option>
+                <option value="verify-ca">verify-ca</option>
+                <option value="verify-full">verify-full</option>
               </select>
             </label>
-            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.9rem", cursor: "pointer" }}>
-              <input type="checkbox" checked={trustCert} onChange={(e) => setTrustCert(e.target.checked)} />
-              <span>Trust Server Certificate (<code>--trust-server-certificate</code>)</span>
-            </label>
           </div>
-          <p>From the updated repository folder on the SQL Server machine:</p>
+          <p>From the updated repository folder on the PostgreSQL source machine:</p>
           <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>python -m pip install -r scripts/connector-requirements.txt{"\n"}{command}</pre>
-          <p>Windows Authentication uses the account running this command. For SQL Authentication add <code>--username 'your-sql-login'</code>; the password is prompted locally.</p>
+          <p>For PostgreSQL Authentication add <code>--username 'postgres'</code>; the password is prompted securely.</p>
           <p>Keep the connector running. When its status becomes online, close this panel and select Test. See <code>docs/LOCAL_CONNECTOR.md</code> for certificate setup and recovery.</p>
         </> : <p>Registration switches this source to connector mode. Registering again invalidates the previous token and cancels pending connector tasks.</p>}
         <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 16 }}>

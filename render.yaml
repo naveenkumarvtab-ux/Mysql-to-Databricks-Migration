@@ -1,31 +1,43 @@
 services:
   - type: web
-    name: databricks-migration-factory
+    name: sql-server-to-databricks-migration
     runtime: docker
-    plan: starter
+    plan: free
     region: singapore
-    branch: codex/single-artifact-repair
+    branch: main
     dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /health
     autoDeployTrigger: commit
-    disk:
-      name: migration-factory-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: ENVIRONMENT
         value: PROD
       - key: DATABASE_URL
-        value: sqlite:////var/data/migration_factory.db
+        value: sqlite:////tmp/migration_factory.db
       - key: JWT_SECRET
         generateValue: true
       - key: BOOTSTRAP_ADMIN_USERNAME
-        sync: false
+        value: admin
       - key: BOOTSTRAP_ADMIN_PASSWORD
-        sync: false
+        generateValue: true
       - key: ALLOWED_ORIGINS
-        value: https://databricks-migration-factory.onrender.com
+        value: "*"
+      - key: SOURCE_TYPE
+        value: POSTGRESQL
+      - key: POSTGRES_HOST
+        sync: false
+      - key: POSTGRES_PORT
+        value: "5432"
+      - key: POSTGRES_DATABASE
+        sync: false
+      - key: POSTGRES_USERNAME
+        sync: false
+      - key: POSTGRES_PASSWORD
+        sync: false
+      - key: POSTGRES_SCHEMA
+        value: public
+      - key: POSTGRES_SSLMODE
+        value: prefer
       - key: SQLSERVER_DRIVER
         value: ODBC Driver 18 for SQL Server
       - key: SQLSERVER_HOST

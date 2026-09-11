@@ -957,14 +957,21 @@ def _upsert_node(db: Session, *, project_id: str, source_object_id: str | None, 
                  environment: str, layer: str, node_type: str, model_role: str, target_name: str, target_fqn: str,
                  generation_strategy: str, confidence: float = 1.0, status: str = "PLANNED",
                  review_required: bool = False, lineage: dict[str, Any] | None = None,
-                 transformation: dict[str, Any] | None = None) -> MigrationMedallionNode:
-    row = db.scalar(select(MigrationMedallionNode).where(
-        MigrationMedallionNode.project_id == project_id,
-        MigrationMedallionNode.environment == environment.upper(),
-        MigrationMedallionNode.target_fqn == target_fqn,
-    ))
+                 transformation: dict[str, Any] | None = None,
+                 node_cache: dict[tuple[str, str, str], MigrationMedallionNode] | None = None) -> MigrationMedallionNode:
+    env = environment.upper()
+    key = (project_id, env, target_fqn)
+    row = None
+    if node_cache is not None and key in node_cache:
+        row = node_cache[key]
     if not row:
-        row = MigrationMedallionNode(id=uid("MDN"), project_id=project_id, environment=environment.upper(),
+        row = db.scalar(select(MigrationMedallionNode).where(
+            MigrationMedallionNode.project_id == project_id,
+            MigrationMedallionNode.environment == env,
+            MigrationMedallionNode.target_fqn == target_fqn,
+        ))
+    if not row:
+        row = MigrationMedallionNode(id=uid("MDN"), project_id=project_id, environment=env,
                                      layer=layer, node_type=node_type, model_role=model_role,
                                      target_name=target_name, target_fqn=target_fqn,
                                      generation_strategy=generation_strategy)
@@ -973,41 +980,63 @@ def _upsert_node(db: Session, *, project_id: str, source_object_id: str | None, 
     row.layer = layer; row.node_type = node_type; row.model_role = model_role; row.target_name = target_name
     row.generation_strategy = generation_strategy; row.confidence_score = confidence; row.status = status
     row.review_required = review_required; row.lineage_json = _json(lineage or {}); row.transformation_json = _json(transformation or {})
+    if node_cache is not None:
+        node_cache[key] = row
     return row
 
 
 def _upsert_edge(db: Session, project_id: str, environment: str, from_id: str, to_id: str,
-                 edge_type: str, evidence: dict[str, Any] | None = None) -> None:
-    row = db.scalar(select(MigrationMedallionEdge).where(
-        MigrationMedallionEdge.project_id == project_id,
-        MigrationMedallionEdge.environment == environment.upper(),
-        MigrationMedallionEdge.from_node_id == from_id,
-        MigrationMedallionEdge.to_node_id == to_id,
-        MigrationMedallionEdge.edge_type == edge_type,
-    ))
+                 edge_type: str, evidence: dict[str, Any] | None = None,
+                 edge_cache: dict[tuple[str, str, str, str, str], MigrationMedallionEdge] | None = None) -> None:
+    env = environment.upper()
+    key = (project_id, env, from_id, to_id, edge_type)
+    row = None
+    if edge_cache is not None and key in edge_cache:
+        row = edge_cache[key]
     if not row:
-        db.add(MigrationMedallionEdge(id=uid("MDE"), project_id=project_id, environment=environment.upper(),
+        row = db.scalar(select(MigrationMedallionEdge).where(
+            MigrationMedallionEdge.project_id == project_id,
+            MigrationMedallionEdge.environment == env,
+            MigrationMedallionEdge.from_node_id == from_id,
+            MigrationMedallionEdge.to_node_id == to_id,
+            MigrationMedallionEdge.edge_type == edge_type,
+        ))
+    if not row:
+        row = MigrationMedallionEdge(id=uid("MDE"), project_id=project_id, environment=env,
                                      from_node_id=from_id, to_node_id=to_id, edge_type=edge_type,
-                                     evidence_json=_json(evidence or {})))
+                                     evidence_json=_json(evidence or {}))
+        db.add(row)
     else:
         row.evidence_json = _json(evidence or {})
+    if edge_cache is not None:
+        edge_cache[key] = row
 
 
 def build_medallion_plan(db: Session, project_id: str, *, environment: str = "DEV", catalog: str | None = None) -> dict[str, Any]:
     if not db.get(MigrationProject, project_id):
         raise ValueError("Project not found")
     env = environment.upper()
-    catalog = (catalog or _catalog_from_mappings(db, project_id, env) or "").strip().strip("`")
+    cfg = get_settings()
+    default_catalog = (
+        cfg.dev_catalog if env == "DEV" else
+        cfg.test_catalog if env == "TEST" else
+        cfg.uat_catalog if env == "UAT" else
+        cfg.prod_catalog
+    )
+    catalog = (catalog or _catalog_from_mappings(db, project_id, env) or default_catalog or "migration_dev").strip().strip("`")
     if not catalog:
         raise ValueError("Target catalog is required. Create mappings first or pass catalog explicitly.")
+
+    objects = list(db.scalars(select(MigrationObject).where(MigrationObject.project_id == project_id).order_by(
+        MigrationObject.schema_name, MigrationObject.object_name)).all())
+    if not objects:
+        raise ValueError("No discovered objects found in project. Please run Discovery on your PostgreSQL source first.")
 
     # Consumer evidence influences semantic recommendations and is refreshed before planning.
     analyze_downstream_consumers(db, project_id)
     if not db.scalars(select(MigrationSemanticDefinition).where(MigrationSemanticDefinition.project_id == project_id)).first():
         infer_semantics(db, project_id, refresh_consumers=False)
 
-    objects = list(db.scalars(select(MigrationObject).where(MigrationObject.project_id == project_id).order_by(
-        MigrationObject.schema_name, MigrationObject.object_name)).all())
     approved_semantics = list(db.scalars(select(MigrationSemanticDefinition).where(
         MigrationSemanticDefinition.project_id == project_id,
         MigrationSemanticDefinition.status == "APPROVED",
@@ -1016,14 +1045,18 @@ def build_medallion_plan(db: Session, project_id: str, *, environment: str = "DE
     for sem in approved_semantics:
         approved_by_object[sem.object_id].append(sem)
 
+    source_proto = (cfg.source_type.lower() if cfg else "postgres")
+    node_cache: dict[tuple[str, str, str], MigrationMedallionNode] = {}
+    edge_cache: dict[tuple[str, str, str, str, str], MigrationMedallionEdge] = {}
     nodes_by_object_layer: dict[tuple[str, str], MigrationMedallionNode] = {}
     for obj in objects:
-        source_fqn = f"sqlserver://{obj.database_name}/{obj.schema_name}/{obj.object_name}"
+        source_fqn = f"{source_proto}://{obj.database_name}/{obj.schema_name}/{obj.object_name}"
         source_node = _upsert_node(
             db, project_id=project_id, source_object_id=obj.id, semantic_definition_id=None, environment=env,
             layer="SOURCE", node_type="SOURCE_OBJECT", model_role=obj.object_type, target_name=obj.object_name,
             target_fqn=source_fqn, generation_strategy="SOURCE_METADATA", confidence=1.0, status="DISCOVERED",
             lineage={"database": obj.database_name, "schema": obj.schema_name, "object": obj.object_name},
+            node_cache=node_cache,
         )
         nodes_by_object_layer[(obj.id, "SOURCE")] = source_node
 
@@ -1034,6 +1067,7 @@ def build_medallion_plan(db: Session, project_id: str, *, environment: str = "DE
                 layer="BRONZE", node_type="DELTA_TABLE", model_role="RAW", target_name=obj.object_name,
                 target_fqn=bronze_fqn, generation_strategy="SOURCE_ALIGNED_DELTA", confidence=1.0,
                 lineage={"source_object_id": obj.id}, transformation={"mode": "RAW_INGEST", "business_transformations": False},
+                node_cache=node_cache,
             )
             silver_fqn = f"{qident(catalog)}.{qident('silver')}.{qident(obj.object_name)}"
             silver = _upsert_node(
@@ -1042,10 +1076,11 @@ def build_medallion_plan(db: Session, project_id: str, *, environment: str = "DE
                 target_fqn=silver_fqn, generation_strategy="STANDARDIZED_PASSTHROUGH", confidence=0.98,
                 lineage={"source_object_id": obj.id, "bronze_target": bronze_fqn},
                 transformation={"mode": "PASSTHROUGH", "note": "No business rule fabricated; source-aligned typed columns are exposed as a reusable Silver entity."},
+                node_cache=node_cache,
             )
             nodes_by_object_layer[(obj.id, "BRONZE")] = bronze; nodes_by_object_layer[(obj.id, "SILVER")] = silver
-            _upsert_edge(db, project_id, env, source_node.id, bronze.id, "RAW_INGEST", {"source_object_id": obj.id})
-            _upsert_edge(db, project_id, env, bronze.id, silver.id, "STANDARDIZE", {"business_rule_fabricated": False})
+            _upsert_edge(db, project_id, env, source_node.id, bronze.id, "RAW_INGEST", {"source_object_id": obj.id}, edge_cache=edge_cache)
+            _upsert_edge(db, project_id, env, bronze.id, silver.id, "STANDARDIZE", {"business_rule_fabricated": False}, edge_cache=edge_cache)
         elif obj.object_type == "VIEW":
             silver_fqn = f"{qident(catalog)}.{qident('silver')}.{qident(obj.object_name)}"
             silver = _upsert_node(
@@ -1053,9 +1088,10 @@ def build_medallion_plan(db: Session, project_id: str, *, environment: str = "DE
                 layer="SILVER", node_type="VIEW", model_role="TRANSFORMATION", target_name=obj.object_name,
                 target_fqn=silver_fqn, generation_strategy="CONVERT_SOURCE_VIEW", confidence=0.90,
                 lineage={"source_object_id": obj.id}, transformation={"mode": "SOURCE_VIEW_CONVERSION"},
+                node_cache=node_cache,
             )
             nodes_by_object_layer[(obj.id, "SILVER")] = silver
-            _upsert_edge(db, project_id, env, source_node.id, silver.id, "CONVERT_LOGIC", {})
+            _upsert_edge(db, project_id, env, source_node.id, silver.id, "CONVERT_LOGIC", {}, edge_cache=edge_cache)
         elif obj.object_type in {"PROCEDURE", "FUNCTION"}:
             if obj.object_type == "PROCEDURE":
                 intent, target = classify_procedure(obj.definition or "")
@@ -1072,9 +1108,10 @@ def build_medallion_plan(db: Session, project_id: str, *, environment: str = "DE
                 generation_strategy=target.replace(" ", "_").upper(), confidence=0.80,
                 review_required=("MANUAL" in target.upper() or "REVIEW" in target.upper() or "PYSPARK" in target.upper()),
                 lineage={"source_object_id": obj.id}, transformation={"intent": intent, "recommended_target": target},
+                node_cache=node_cache,
             )
             nodes_by_object_layer[(obj.id, "SILVER")] = routine
-            _upsert_edge(db, project_id, env, source_node.id, routine.id, "CONVERT_LOGIC", {"intent": intent})
+            _upsert_edge(db, project_id, env, source_node.id, routine.id, "CONVERT_LOGIC", {"intent": intent}, edge_cache=edge_cache)
         elif obj.object_type == "TRIGGER":
             intent, target = classify_trigger(obj.definition or "")
             fqn = f"architecture-review://{obj.schema_name}/{obj.object_name}"
@@ -1084,13 +1121,15 @@ def build_medallion_plan(db: Session, project_id: str, *, environment: str = "DE
                 target_fqn=fqn, generation_strategy=target.replace(" ", "_").upper(), confidence=0.70,
                 status="REVIEW_REQUIRED", review_required=True,
                 transformation={"trigger_intent": intent, "recommended_target": target},
+                node_cache=node_cache,
             )
             nodes_by_object_layer[(obj.id, "SILVER")] = trg
-            _upsert_edge(db, project_id, env, source_node.id, trg.id, "REDESIGN_LOGIC", {"intent": intent})
+            _upsert_edge(db, project_id, env, source_node.id, trg.id, "REDESIGN_LOGIC", {"intent": intent}, edge_cache=edge_cache)
 
     # Add dependency lineage between generated nodes. Tables feed Silver views/routines through
     # their Bronze targets; converted views/functions feed consumers through Silver targets.
     object_lookup = {(o.schema_name.lower(), o.object_name.lower()): o for o in objects}
+    seen_dep_edges = set()
     for dep in db.scalars(select(MigrationDependency).where(MigrationDependency.project_id == project_id)).all():
         consumer_node = nodes_by_object_layer.get((dep.object_id, "SILVER"))
         if not consumer_node or not dep.referenced_object:
@@ -1105,9 +1144,12 @@ def build_medallion_plan(db: Session, project_id: str, *, environment: str = "DE
             continue
         producer_node = nodes_by_object_layer.get((producer.id, "BRONZE")) or nodes_by_object_layer.get((producer.id, "SILVER"))
         if producer_node and producer_node.id != consumer_node.id:
-            _upsert_edge(db, project_id, env, producer_node.id, consumer_node.id, "READS_FROM", {
-                "dependency_type": dep.dependency_type, "referenced_column": dep.referenced_column,
-            })
+            dep_key = (producer_node.id, consumer_node.id)
+            if dep_key not in seen_dep_edges:
+                seen_dep_edges.add(dep_key)
+                _upsert_edge(db, project_id, env, producer_node.id, consumer_node.id, "READS_FROM", {
+                    "dependency_type": dep.dependency_type, "referenced_column": dep.referenced_column,
+                }, edge_cache=edge_cache)
 
     # Gold nodes are generated only from explicit/approved business semantics. Inferred semantics
     # remain recommendations until a person approves them, preventing fabricated KPIs/models.
@@ -1131,9 +1173,10 @@ def build_medallion_plan(db: Session, project_id: str, *, environment: str = "DE
                 "dimension_keys": _loads(sem.dimension_keys_json, []), "attributes": _loads(sem.attributes_json, []),
                 "measures": _loads(sem.measures_json, []), "scd_type": sem.scd_type,
             },
+            node_cache=node_cache,
         )
         nodes_by_object_layer[(obj.id, f"GOLD:{sem.id}")] = gold
-        _upsert_edge(db, project_id, env, silver.id, gold.id, "SERVES_GOLD", {"semantic_role": sem.semantic_role})
+        _upsert_edge(db, project_id, env, silver.id, gold.id, "SERVES_GOLD", {"semantic_role": sem.semantic_role}, edge_cache=edge_cache)
 
     db.commit()
     return medallion_plan(db, project_id, environment=env)
@@ -1200,13 +1243,28 @@ def _replace_source_references(db: Session, project_id: str, environment: str, s
         node = by_obj_layer.get((obj.id, desired)) or by_obj_layer.get((obj.id, "SILVER")) or by_obj_layer.get((obj.id, "BRONZE"))
         if not node:
             continue
+        
+        # 1. Qualified names: [schema].[object], schema.object, `schema`.`object`, "schema"."object"
         patterns = [
-            rf"(?<![\w`])\[{re.escape(obj.schema_name)}\]\.\[{re.escape(obj.object_name)}\](?![\w`])",
-            rf"(?<![\w`]){re.escape(obj.schema_name)}\.{re.escape(obj.object_name)}(?![\w`])",
-            rf"(?<![\w`])`{re.escape(obj.schema_name)}`\.`{re.escape(obj.object_name)}`(?![\w`])",
+            rf"(?<![\w`\"\[])\[?{re.escape(obj.schema_name)}\]?\.\[?{re.escape(obj.object_name)}\]?(?![\w`\"\]])",
+            rf"(?<![\w`\"\[])`?{re.escape(obj.schema_name)}`?\.`?{re.escape(obj.object_name)}`?(?![\w`\"\]])",
+            rf"(?<![\w`\"\[])\"?{re.escape(obj.schema_name)}\"?\.\"?{re.escape(obj.object_name)}\"?(?![\w`\"\]])",
         ]
         for pat in patterns:
             out = re.sub(pat, node.target_fqn, out, flags=re.I)
+
+        # 2. Bracketed or quoted single identifier: [object], `object`, "object"
+        single_quoted = [
+            rf"(?<![\w`\"'.])\[{re.escape(obj.object_name)}\](?![\w`\"'])",
+            rf"(?<![\w`\"'.])\"{re.escape(obj.object_name)}\"(?![\w`\"'])",
+            rf"(?<![\w`\"'.])`{re.escape(obj.object_name)}`(?![\w`\"'])",
+        ]
+        for pat in single_quoted:
+            out = re.sub(pat, node.target_fqn, out, flags=re.I)
+
+        # 3. Clause-context bare identifier: FROM table, JOIN table, INTO table, UPDATE table, TABLE table
+        clause_pat = rf"(\b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+)(?:\[?|`?|\"?){re.escape(obj.object_name)}(?:\]?|`?|\"?)(?=[^\w`\"'\.]|$)"
+        out = re.sub(clause_pat, rf"\g<1>{node.target_fqn}", out, flags=re.I)
     return out
 
 
@@ -1330,6 +1388,8 @@ def _stage_content(db: Session, project_id: str, node: MigrationMedallionNode, e
             content, executable, reason = _convert_procedure(db, project_id, obj, transient, environment)
         else:
             content, executable, reason = _convert_function(db, project_id, obj, transient, environment)
+        if executable:
+            content = _replace_source_references(db, project_id, environment, content, for_gold=False)
         return content, executable, [] if executable else [reason]
     if node.layer == "SILVER" and obj and obj.object_type == "TRIGGER":
         intent, target = classify_trigger(obj.definition or "")

@@ -28,17 +28,29 @@ from uuid import UUID
 from .rules import map_sqlserver_type
 
 
-BINARY_SOURCE_TYPES = {"binary", "varbinary", "image", "timestamp", "rowversion"}
-INTEGER_SOURCE_TYPES = {"bigint", "int", "smallint", "tinyint"}
-FLOAT_SOURCE_TYPES = {"float", "real"}
-DECIMAL_SOURCE_TYPES = {"decimal", "numeric", "money", "smallmoney"}
+BINARY_SOURCE_TYPES = {"binary", "varbinary", "image", "timestamp", "rowversion", "bytea", "blob"}
+INTEGER_SOURCE_TYPES = {
+    "bigint", "int", "integer", "smallint", "tinyint",
+    "int2", "int4", "int8", "serial", "bigserial", "smallserial",
+    "serial2", "serial4", "serial8"
+}
+FLOAT_SOURCE_TYPES = {"float", "float4", "float8", "real", "double precision", "double"}
+DECIMAL_SOURCE_TYPES = {"decimal", "numeric", "money", "smallmoney", "number"}
 STRING_SOURCE_TYPES = {
-    "char", "varchar", "text", "nchar", "nvarchar", "ntext", "sysname", "json"
+    "char", "varchar", "character varying", "character", "text", "nchar", "nvarchar",
+    "ntext", "sysname", "json", "jsonb", "citext", "name", "bpchar",
+    "uuid", "inet", "cidr", "macaddr", "macaddr8", "tsvector", "tsquery", "interval"
 }
 DATE_SOURCE_TYPES = {"date"}
-DATETIME_SOURCE_TYPES = {"datetime", "datetime2", "smalldatetime"}
-GOVERNED_TEXT_TYPES = {"time", "datetimeoffset", "sql_variant", "xml", "hierarchyid"}
-SPATIAL_SOURCE_TYPES = {"geography", "geometry"}
+DATETIME_SOURCE_TYPES = {
+    "datetime", "datetime2", "smalldatetime", "timestamptz",
+    "timestamp with time zone", "timestamp without time zone"
+}
+GOVERNED_TEXT_TYPES = {
+    "time", "timetz", "time with time zone", "time without time zone",
+    "datetimeoffset", "sql_variant", "xml", "hierarchyid"
+}
+SPATIAL_SOURCE_TYPES = {"geography", "geometry", "point", "line", "lseg", "box", "path", "polygon", "circle"}
 
 KNOWN_SOURCE_TYPES = (
     BINARY_SOURCE_TYPES
@@ -50,7 +62,7 @@ KNOWN_SOURCE_TYPES = (
     | DATETIME_SOURCE_TYPES
     | GOVERNED_TEXT_TYPES
     | SPATIAL_SOURCE_TYPES
-    | {"bit", "uniqueidentifier"}
+    | {"bit", "bool", "boolean", "uniqueidentifier"}
 )
 
 
@@ -128,23 +140,23 @@ ADAPTER_SPECS: tuple[AdapterSpec, ...] = (
     AdapterSpec(
         "binary.hex.v2", "BINARY", frozenset(BINARY_SOURCE_TYPES),
         "HEX_STRING_TO_BINARY", "unhex(?)", False, True,
-        "Binary values are source-projected as style-2 hexadecimal text and rebuilt with Databricks unhex().",
-        "SQLSERVER_HEX_STYLE_2",
+        "Binary values are source-projected as hexadecimal text and rebuilt with Databricks unhex().",
+        "HEX_TEXT",
     ),
-    AdapterSpec("boolean.native.v1", "BOOLEAN", frozenset({"bit"}), "BOOLEAN_NATIVE"),
+    AdapterSpec("boolean.native.v1", "BOOLEAN", frozenset({"bit", "bool", "boolean"}), "BOOLEAN_NATIVE"),
     AdapterSpec("integer.native.v1", "INTEGER", frozenset(INTEGER_SOURCE_TYPES), "INTEGER_NATIVE"),
     AdapterSpec("float.native.v1", "FLOAT", frozenset(FLOAT_SOURCE_TYPES), "FLOAT_NATIVE"),
     AdapterSpec("decimal.native.v2", "DECIMAL", frozenset(DECIMAL_SOURCE_TYPES), "DECIMAL_NATIVE"),
-    AdapterSpec("uuid.string.v1", "UUID", frozenset({"uniqueidentifier"}), "UUID_STRING", source_projection="VARCHAR_36"),
+    AdapterSpec("uuid.string.v1", "UUID", frozenset({"uniqueidentifier", "uuid"}), "UUID_STRING", source_projection="TEXT"),
     AdapterSpec("date.native.v1", "DATE", frozenset(DATE_SOURCE_TYPES), "DATE_NATIVE"),
     AdapterSpec("datetime.native.v1", "DATETIME", frozenset(DATETIME_SOURCE_TYPES), "DATETIME_NATIVE"),
-    AdapterSpec("time.iso.v1", "TIME", frozenset({"time"}), "TIME_ISO_STRING", notes="Preserves SQL Server time without inventing timezone semantics."),
+    AdapterSpec("time.iso.v1", "TIME", frozenset({"time", "timetz", "time with time zone", "time without time zone"}), "TIME_ISO_STRING", notes="Preserves time without inventing timezone semantics."),
     AdapterSpec("datetimeoffset.iso.v1", "DATETIMEOFFSET", frozenset({"datetimeoffset"}), "DATETIMEOFFSET_ISO_STRING", notes="Preserves the source offset exactly as ISO text."),
-    AdapterSpec("xml.string.v1", "XML", frozenset({"xml"}), "XML_STRING", source_projection="NVARCHAR_MAX"),
+    AdapterSpec("xml.string.v1", "XML", frozenset({"xml"}), "XML_STRING", source_projection="TEXT"),
     AdapterSpec(
         "sqlvariant.governed.v1", "SQL_VARIANT", frozenset({"sql_variant"}), "SQL_VARIANT_STRING",
         review_required=True, deterministic=True,
-        notes="sql_variant is preserved textually; semantic retargeting requires review.", source_projection="NVARCHAR_MAX",
+        notes="sql_variant is preserved textually; semantic retargeting requires review.", source_projection="TEXT",
     ),
     AdapterSpec("hierarchyid.string.v1", "HIERARCHYID", frozenset({"hierarchyid"}), "HIERARCHYID_STRING", source_projection="TOSTRING"),
     AdapterSpec(
@@ -160,13 +172,23 @@ _SPEC_BY_TYPE = {source_type: spec for spec in ADAPTER_SPECS for source_type in 
 
 
 def normalize_source_type(name: str | None) -> str:
-    text = (name or "").strip().lower().replace("[", "").replace("]", "")
+    text = (name or "").strip().lower().replace("[", "").replace("]", "").replace('"', '')
     # Defensive support for imported declarations such as decimal(18,2), varchar(max), time(7).
     return re.sub(r"\s*\(.*\)\s*$", "", text)
 
 
+def quote_postgres_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
 def quote_sqlserver_identifier(name: str) -> str:
     return "[" + name.replace("]", "]]" ) + "]"
+
+
+def quote_identifier(name: str, source_type: str = "POSTGRESQL") -> str:
+    if source_type.upper() == "POSTGRESQL":
+        return quote_postgres_identifier(name)
+    return quote_sqlserver_identifier(name)
 
 
 def adapter_spec(source_type: str | None) -> AdapterSpec:
@@ -175,13 +197,13 @@ def adapter_spec(source_type: str | None) -> AdapterSpec:
     if spec:
         return spec
     # User-defined aliases and unknown types are never silently guessed.  They use a
-    # reversible textual transport where SQL Server can convert them, and are surfaced
+    # reversible textual transport where the source can convert them, and are surfaced
     # for architecture review before semantic retargeting.
     return AdapterSpec(
         "unknown.governed_text.v1", "UNKNOWN", frozenset(), "GOVERNED_TEXT_FALLBACK",
         review_required=True, deterministic=True,
         notes="Unknown/user-defined source type uses governed text fallback; approve target semantics before production promotion.",
-        source_projection="NVARCHAR_MAX",
+        source_projection="TEXT",
     )
 
 
@@ -208,25 +230,42 @@ def transport_plan(source_type: str, precision: int | None = None, scale: int | 
     )
 
 
-def source_select_expression(column: Any) -> str:
+def source_select_expression(column: Any, source_type: str = "POSTGRESQL") -> str:
     """Return a source-side projection selected only from discovered metadata."""
-    name = quote_sqlserver_identifier(str(column.column_name))
+    col_name = str(column.column_name)
+    is_pg = source_type.upper() == "POSTGRESQL"
+    quoted_name = quote_postgres_identifier(col_name) if is_pg else quote_sqlserver_identifier(col_name)
     plan = transport_plan(column.data_type, getattr(column, "precision", None), getattr(column, "scale", None))
+    
     if plan.strategy == "HEX_STRING_TO_BINARY":
-        # Style 2 guarantees hexadecimal characters without the 0x prefix.
-        return f"CONVERT(VARCHAR(MAX), CONVERT(VARBINARY(MAX), {name}), 2) AS {name}"
+        if is_pg:
+            # PostgreSQL bytea encode to hex
+            return f"encode({quoted_name}, 'hex') AS {quoted_name}"
+        # SQL Server style 2 hex
+        return f"CONVERT(VARCHAR(MAX), CONVERT(VARBINARY(MAX), {quoted_name}), 2) AS {quoted_name}"
+    
     if plan.strategy == "UUID_STRING":
-        return f"CONVERT(VARCHAR(36), {name}) AS {name}"
+        if is_pg:
+            return f"{quoted_name}::text AS {quoted_name}"
+        return f"CONVERT(VARCHAR(36), {quoted_name}) AS {quoted_name}"
+        
     if plan.strategy in {"XML_STRING", "SQL_VARIANT_STRING", "GOVERNED_TEXT_FALLBACK"}:
-        return f"CONVERT(NVARCHAR(MAX), {name}) AS {name}"
+        if is_pg:
+            return f"{quoted_name}::text AS {quoted_name}"
+        return f"CONVERT(NVARCHAR(MAX), {quoted_name}) AS {quoted_name}"
+        
     if plan.strategy == "HIERARCHYID_STRING":
-        return f"CASE WHEN {name} IS NULL THEN NULL ELSE {name}.ToString() END AS {name}"
+        return f"CASE WHEN {quoted_name} IS NULL THEN NULL ELSE {quoted_name}.ToString() END AS {quoted_name}"
+        
     if plan.strategy == "SPATIAL_SRID_WKT_STRING":
+        if is_pg:
+            return f"{quoted_name}::text AS {quoted_name}"
         return (
-            f"CASE WHEN {name} IS NULL THEN NULL ELSE "
-            f"CONCAT('SRID=', {name}.STSrid, ';', {name}.STAsText()) END AS {name}"
+            f"CASE WHEN {quoted_name} IS NULL THEN NULL ELSE "
+            f"CONCAT('SRID=', {quoted_name}.STSrid, ';', {quoted_name}.STAsText()) END AS {quoted_name}"
         )
-    return name
+    return quoted_name
+
 
 
 def target_parameter_expression(column: Any) -> str:

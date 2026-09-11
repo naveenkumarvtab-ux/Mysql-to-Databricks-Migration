@@ -377,6 +377,14 @@ def _apply_table_schema_policy(db: Session, project_id: str, obj: MigrationObjec
 
 def _source_connection_string(src: MigrationSource) -> str:
     cfg = get_settings()
+    if cfg.source_type.upper() == "POSTGRESQL" or (src.server_name and ":" in src.server_name) or cfg.postgres_host:
+        host = cfg.postgres_host or src.server_name or "localhost"
+        port = cfg.postgres_port or 5432
+        db = src.database_name or cfg.postgres_database or "postgres"
+        user = cfg.postgres_username or "postgres"
+        pwd = cfg.postgres_password or ""
+        sslmode = cfg.postgres_sslmode or "prefer"
+        return f"postgresql://{user}:{pwd}@{host}:{port}/{db}?sslmode={sslmode}"
     driver = cfg.sqlserver_driver.replace("{", "").replace("}", "")
     if cfg.sqlserver_username:
         return (f"DRIVER={{{driver}}};SERVER={src.server_name};DATABASE={src.database_name};"
@@ -391,11 +399,28 @@ def _source_rows(src, obj, cols, sql_text, max_rows):
         with TableStream(src.id, obj, cols, max_rows) as stream:
             yield stream
     else:
-        import pyodbc
-        with pyodbc.connect(_source_connection_string(src), timeout=30) as conn:
-            cursor = conn.cursor()
-            cursor.execute(sql_text)
-            yield cursor
+        cfg = get_settings()
+        if cfg.source_type.upper() == "POSTGRESQL" or (cfg.postgres_host and not cfg.sqlserver_host):
+            try:
+                import psycopg2
+            except ImportError:
+                import psycopg as psycopg2
+            conn_url = _source_connection_string(src)
+            from app.services.discovery import parse_postgres_conn
+            conn_dict = parse_postgres_conn(conn_url)
+            conn = psycopg2.connect(**conn_dict)
+            try:
+                cursor = conn.cursor()
+                cursor.execute(sql_text)
+                yield cursor
+            finally:
+                conn.close()
+        else:
+            import pyodbc
+            with pyodbc.connect(_source_connection_string(src), timeout=30) as conn:
+                cursor = conn.cursor()
+                cursor.execute(sql_text)
+                yield cursor
 
 
 def load_bronze_table(db: Session, project_id: str, obj: MigrationObject, mapping: MigrationMapping,
@@ -427,14 +452,21 @@ def load_bronze_table(db: Session, project_id: str, obj: MigrationObject, mappin
     if not names:
         return {"status": "PASSED", "rows": 0}
 
-    # Build the source projection and target bind expressions from discovered metadata.
-    # Binary/rowversion columns are transported as hexadecimal strings and reconstructed
-    # with unhex(?) on Databricks so the connector can never infer ARRAY<VOID>.
-    select_cols = ",".join(source_select_expression(c) for c in cols)
-    source_table = f"[{obj.schema_name.replace(']',']]')}].[{obj.object_name.replace(']',']]')}]"
-    sql_text = f"SELECT {select_cols} FROM {source_table}"
-    if max_rows:
-        sql_text = f"SELECT TOP ({int(max_rows)}) {select_cols} FROM {source_table}"
+    cfg = get_settings()
+    is_pg = cfg.source_type.upper() == "POSTGRESQL" or (cfg.postgres_host and not cfg.sqlserver_host)
+    select_cols = ",".join(source_select_expression(c, "POSTGRESQL" if is_pg else "SQLSERVER") for c in cols)
+    if is_pg:
+        clean_schema = obj.schema_name.replace('"', '""')
+        clean_obj = obj.object_name.replace('"', '""')
+        source_table = f'"{clean_schema}"."{clean_obj}"'
+        sql_text = f"SELECT {select_cols} FROM {source_table}"
+        if max_rows:
+            sql_text += f" LIMIT {int(max_rows)}"
+    else:
+        source_table = f"[{obj.schema_name.replace(']',']]')}].[{obj.object_name.replace(']',']]')}]"
+        sql_text = f"SELECT {select_cols} FROM {source_table}"
+        if max_rows:
+            sql_text = f"SELECT TOP ({int(max_rows)}) {select_cols} FROM {source_table}"
     value_expressions = [target_parameter_expression(c) for c in cols] + ["?"]
     placeholders = ",".join(value_expressions)
     target_cols = ",".join([f"`{n.replace('`','``')}`" for n in names] + ["`_migration_source_system`"])
@@ -697,14 +729,33 @@ def _routine_exists(target_fqn: str, routine_type: str) -> None:
 def _source_table_count(source: MigrationSource, obj: MigrationObject) -> int:
     if connector_info(source.id)["mode"] == "CONNECTOR":
         return int(connector_request(source.id, "count", {"schema": obj.schema_name, "table": obj.object_name})["count"])
-    import pyodbc
-    with pyodbc.connect(_source_connection_string(source), timeout=30) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            f"SELECT COUNT(*) FROM [{obj.schema_name.replace(']', ']]')}]."
-            f"[{obj.object_name.replace(']', ']]')}]"
-        )
-        return int(cur.fetchone()[0])
+    cfg = get_settings()
+    if cfg.source_type.upper() == "POSTGRESQL" or (cfg.postgres_host and not cfg.sqlserver_host):
+        try:
+            import psycopg2
+        except ImportError:
+            import psycopg as psycopg2
+        conn_url = _source_connection_string(source)
+        from app.services.discovery import parse_postgres_conn
+        conn_dict = parse_postgres_conn(conn_url)
+        conn = psycopg2.connect(**conn_dict)
+        try:
+            cur = conn.cursor()
+            clean_schema = obj.schema_name.replace('"', '""')
+            clean_obj = obj.object_name.replace('"', '""')
+            cur.execute(f'SELECT COUNT(*) FROM "{clean_schema}"."{clean_obj}"')
+            return int(cur.fetchone()[0])
+        finally:
+            conn.close()
+    else:
+        import pyodbc
+        with pyodbc.connect(_source_connection_string(source), timeout=30) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT COUNT(*) FROM [{obj.schema_name.replace(']', ']]')}]."
+                f"[{obj.object_name.replace(']', ']]')}]"
+            )
+            return int(cur.fetchone()[0])
 
 
 def _reconcile_medallion_run(

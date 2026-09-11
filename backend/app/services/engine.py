@@ -85,14 +85,16 @@ def databricks_routine_contract_issues(content: str, object_type: str) -> list[s
 def _retarget_view_header(content: str, target_fqn: str) -> str:
     """Make a discovered view definition idempotent and target the governed DEV FQN.
 
-    SQL Server commonly stores SET/GO session preambles before CREATE VIEW. They are not
-    executable Databricks view syntax, so start from the first static CREATE VIEW header.
+    Handles SQL Server CREATE VIEW, PostgreSQL CREATE VIEW, and raw SELECT/WITH view bodies.
     """
+    cleaned = content.strip()
     pattern = r"(?is)\bCREATE\s+(?:OR\s+(?:ALTER|REPLACE)\s+)?VIEW\s+[^\s(]+"
-    match = re.search(pattern, content)
-    if not match:
-        return content
-    return f"CREATE OR REPLACE VIEW {target_fqn}" + content[match.end():]
+    match = re.search(pattern, cleaned)
+    if match:
+        return f"CREATE OR REPLACE VIEW {target_fqn}" + cleaned[match.end():]
+    if re.match(r"(?is)^(?:SELECT|WITH)\b", cleaned):
+        return f"CREATE OR REPLACE VIEW {target_fqn} AS\n{cleaned}"
+    return f"CREATE OR REPLACE VIEW {target_fqn} AS\n{cleaned}"
 
 def ensure_project(db: Session, name: str) -> MigrationProject:
     p = db.scalar(select(MigrationProject).where(MigrationProject.name==name))
@@ -174,6 +176,49 @@ def create_mappings(db: Session, project_id: str, environment: str, catalog: str
     db.commit(); return n
 
 
+def _parse_params_from_definition(definition: str) -> list[dict]:
+    m = re.search(r"\b(?:PROCEDURE|FUNCTION)\s+[\w\.\"`\[\]]+\s*\(([\s\S]*?)\)", definition or "", flags=re.I)
+    if not m:
+        return []
+    param_str = m.group(1).strip()
+    if not param_str:
+        return []
+    params = []
+    raw_params = [p.strip() for p in re.split(r",(?![^\(]*\))", param_str) if p.strip()]
+    for idx, p in enumerate(raw_params, 1):
+        tokens = p.split()
+        if not tokens:
+            continue
+        is_output = False
+        mode = "IN"
+        if tokens[0].upper() in {"IN", "OUT", "INOUT", "VARIADIC"}:
+            mode = tokens[0].upper()
+            is_output = mode in {"OUT", "INOUT"}
+            tokens = tokens[1:]
+        if not tokens:
+            continue
+        param_name = tokens[0].strip('"`[]')
+        type_str = " ".join(tokens[1:]) if len(tokens) > 1 else "string"
+        t_match = re.match(r"^([^\(]+)(?:\((\d+)(?:,\s*(\d+))?\))?", type_str)
+        if t_match:
+            base_type = t_match.group(1).strip()
+            prec = int(t_match.group(2)) if t_match.group(2) else None
+            scale = int(t_match.group(3)) if t_match.group(3) else None
+        else:
+            base_type = type_str
+            prec = None
+            scale = None
+        params.append({
+            "name": param_name,
+            "ordinal": idx,
+            "type": base_type,
+            "precision": prec,
+            "scale": scale,
+            "is_output": is_output
+        })
+    return params
+
+
 def _routine_parameters(db: Session, project_id: str, object_id: str) -> list[dict]:
     rows=db.scalars(select(CanonicalRecord).where(
         CanonicalRecord.project_id==project_id,
@@ -188,7 +233,12 @@ def _routine_parameters(db: Session, project_id: str, object_id: str) -> list[di
             payload={}
         if payload:
             out.append(payload)
-    return sorted(out,key=lambda x:int(x.get("ordinal") or 0))
+    if out:
+        return sorted(out,key=lambda x:int(x.get("ordinal") or 0))
+    obj = db.get(MigrationObject, object_id)
+    if obj and obj.definition:
+        return _parse_params_from_definition(obj.definition)
+    return []
 
 
 def _parameter_signature(params: list[dict], *, procedure: bool=False) -> str:
@@ -225,8 +275,9 @@ def _replace_known_references(db: Session, project_id: str, environment: str, co
             continue
         _,sch,name=parts
         patterns=[
-            rf"(?<![\w`])\[?{re.escape(sch)}\]?\.\[?{re.escape(name)}\]?(?![\w`])",
-            rf"(?<![\w`])`?{re.escape(sch)}`?\.`?{re.escape(name)}`?(?![\w`])",
+            rf"(?<![\w`\"\[])\[?{re.escape(sch)}\]?\.\[?{re.escape(name)}\]?(?![\w`\"\]])",
+            rf"(?<![\w`\"\[])`?{re.escape(sch)}`?\.`?{re.escape(name)}`?(?![\w`\"\]])",
+            rf"(?<![\w`\"\[])\"?{re.escape(sch)}\"?\.\"?{re.escape(name)}\"?(?![\w`\"\]])",
         ]
         for pat in patterns:
             out=re.sub(pat,lambda _: x.target_fqn,out,flags=re.I)
@@ -239,6 +290,10 @@ def _replace_known_references(db: Session, project_id: str, environment: str, co
             rf"(?i)(?<=\bJOIN\s)`{re.escape(name)}`(?![\w`\.])",
             rf"(?i)(?<=\bINTO\s)`{re.escape(name)}`(?![\w`\.])",
             rf"(?i)(?<=\bUPDATE\s)`{re.escape(name)}`(?![\w`\.])",
+            rf"(?i)(?<=\bFROM\s)\"{re.escape(name)}\"(?![\w`\.])",
+            rf"(?i)(?<=\bJOIN\s)\"{re.escape(name)}\"(?![\w`\.])",
+            rf"(?i)(?<=\bINTO\s)\"{re.escape(name)}\"(?![\w`\.])",
+            rf"(?i)(?<=\bUPDATE\s)\"{re.escape(name)}\"(?![\w`\.])",
         ]
         for pat in table_patterns:
             out=re.sub(pat,lambda _: x.target_fqn,out)
@@ -246,15 +301,31 @@ def _replace_known_references(db: Session, project_id: str, environment: str, co
 
 
 def _clean_routine_body(definition: str) -> str:
-    # Strip routine header and common T-SQL / PL/SQL session noise without inventing logic.
-    m=re.search(r"\b(?:AS|IS)\b(.*)$",definition or "",flags=re.I|re.S)
-    body=(m.group(1) if m else definition or "").strip()
-    body=re.sub(r"^\s*BEGIN\b","",body,flags=re.I).strip()
-    body=re.sub(r"(?is)\bGO\s*;?\s*$", "", body).strip()
-    body=re.sub(r"(?is)\bEND\s*(?:[A-Za-z_]\w*)?\s*;?\s*$", "", body).strip()
-    body=re.sub(r"\bSET\s+NOCOUNT\s+ON\s*;?","",body,flags=re.I)
-    body=re.sub(r"\bSET\s+ANSI_NULLS\s+(?:ON|OFF)\s*;?","",body,flags=re.I)
-    body=re.sub(r"\bSET\s+QUOTED_IDENTIFIER\s+(?:ON|OFF)\s*;?","",body,flags=re.I)
+    # 1. Handle PostgreSQL dollar quoting ($tag$ ... $tag$ or $$ ... $$) or single quote (' ... ')
+    dollar_match = re.search(r"\bAS\s+(\$([A-Za-z0-9_]*)\$)([\s\S]*?)\1\s*;?\s*$", definition or "", flags=re.I)
+    if dollar_match:
+        body = dollar_match.group(3).strip()
+    else:
+        # Fallback to AS/IS match (T-SQL, PL/SQL)
+        m = re.search(r"\b(?:AS|IS)\b(.*)$", definition or "", flags=re.I | re.S)
+        body = (m.group(1) if m else definition or "").strip()
+        if body.startswith("$$") and body.endswith("$$"):
+            body = body[2:-2].strip()
+        elif body.startswith("'") and body.endswith("'"):
+            body = body[1:-1].strip()
+
+    # 2. Strip standard BEGIN ... END wrapper if present
+    body = re.sub(r"^\s*BEGIN\b", "", body, flags=re.I).strip()
+    body = re.sub(r"(?is)\bGO\s*;?\s*$", "", body).strip()
+    body = re.sub(r"(?is)\bEND\s*(?:[A-Za-z_]\w*)?\s*;?\s*$", "", body).strip()
+    body = re.sub(r"\bSET\s+NOCOUNT\s+ON\s*;?", "", body, flags=re.I)
+    body = re.sub(r"\bSET\s+ANSI_NULLS\s+(?:ON|OFF)\s*;?", "", body, flags=re.I)
+    body = re.sub(r"\bSET\s+QUOTED_IDENTIFIER\s+(?:ON|OFF)\s*;?", "", body, flags=re.I)
+    # Also strip any leftover dollar tag in case of non-standard end
+    body = re.sub(r"^\s*\$[A-Za-z0-9_]*\$\s*", "", body, flags=re.I)
+    body = re.sub(r"\s*\$[A-Za-z0-9_]*\$\s*;?\s*$", "", body, flags=re.I)
+    body = re.sub(r"^\s*BEGIN\b", "", body, flags=re.I).strip()
+    body = re.sub(r"(?is)\bEND\s*(?:[A-Za-z_]\w*)?\s*;?\s*$", "", body).strip()
     return body.strip()
 
 

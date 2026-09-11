@@ -157,7 +157,7 @@ function Login({ done }: { done: () => void }) {
       <div className="login-card">
         <div className="brandmark">MF</div>
         <h1>Migration Factory</h1>
-        <p>Enterprise SQL Server → Databricks Control Plane</p>
+        <p>Enterprise PostgreSQL → Databricks Control Plane</p>
         <input
           value={u}
           onChange={(e) => setU(e.target.value)}
@@ -983,10 +983,10 @@ export default function App() {
     },
     {
       phase: "SETUP",
-      title: "Configure the SQL Server source",
+      title: "Configure the PostgreSQL source",
       description: "Add the source profile and verify the live connection before discovery.",
       page: "Sources",
-      action: "Configure and verify the SQL Server source",
+      action: "Configure and verify the PostgreSQL source",
       complete: sources.length > 0,
       evidence: `${sources.length} source profile${sources.length === 1 ? "" : "s"}`,
     },
@@ -1212,7 +1212,7 @@ export default function App() {
       <main>
         <header>
           <div className="header-title">
-            <div className="eyebrow">SQL SERVER → DATABRICKS</div>
+            <div className="eyebrow">POSTGRESQL → DATABRICKS</div>
             <h2>{displayPage(page)}</h2>
             <p>
               Metadata-first migration orchestration with governed promotion and
@@ -1252,7 +1252,7 @@ export default function App() {
               <div className="workflow-hero">
                 <div>
                   <div className="hero-kicker"><Workflow size={15} /> Guided migration journey</div>
-                  <h1>{current?.name || "Start your SQL Server migration"}</h1>
+                  <h1>{current?.name || "Start your PostgreSQL migration"}</h1>
                   <p>
                     Follow one governed path from project setup through PROD validation, cutover and source retirement.
                     Existing migration functions remain on their original pages.
@@ -1343,7 +1343,7 @@ export default function App() {
                   </div>
                   <h1>{current?.name || "Select a migration project"}</h1>
                   <p>
-                    Discover, assess, transform, validate and promote SQL Server
+                    Discover, assess, transform, validate and promote PostgreSQL
                     workloads into governed Databricks medallion architecture.
                   </p>
                   <div className="hero-actions">
@@ -1474,7 +1474,7 @@ export default function App() {
                     <b>1. Administrator</b>
                     <span>
                       Configure .env, create admin, start backend/frontend, and
-                      verify SQL Server plus Databricks connectivity.
+                      verify PostgreSQL plus Databricks connectivity.
                     </span>
                   </div>
                   <div className="runbook-arrow">→</div>
@@ -1543,7 +1543,7 @@ export default function App() {
 [Login / Select Project]
                   │
                   ▼
-[SQL Server Source] → [Test Connection] → [Discovery]
+[PostgreSQL Source] → [Test Connection] → [Discovery]
                   │                         │
                   │                         ▼
                   └──────────────────→ [Inventory + Dependencies]
@@ -1633,10 +1633,10 @@ export default function App() {
                 <button
                   disabled={!pid}
                   onClick={() => {
-                    const profile = prompt("Profile name", "SQLServer1");
+                    const profile = prompt("Profile name", "PostgresServer1");
                     const server =
-                      profile && prompt("SQL Server / instance", "localhost");
-                    const db = server && prompt("Database name");
+                      profile && prompt("PostgreSQL Host / Server", "localhost");
+                    const db = server && prompt("Database name", "postgres");
                     if (profile && server && db)
                       action(() =>
                         api(`/projects/${pid}/sources`, {
@@ -1694,7 +1694,7 @@ export default function App() {
                   </tbody>
                 </table>
               ) : (
-                <Empty text="Add a SQL Server source connection profile to this project." />
+                <Empty text="Add a PostgreSQL source connection profile to this project." />
               )}
               {discoveryResult && (
                 <pre>{JSON.stringify(discoveryResult, null, 2)}</pre>
@@ -1702,7 +1702,7 @@ export default function App() {
             </Panel>
           )}
           {page === "Discovery" && (
-            <Panel title="SQL Server discovery">
+            <Panel title="PostgreSQL discovery">
               {sources.length ? (
                 <div className="action-list">
                   {sources.map((s) => (
@@ -4771,7 +4771,7 @@ export default function App() {
               {diag ? (
                 <pre>{JSON.stringify(diag, null, 2)}</pre>
               ) : (
-                <Empty text="Run diagnostics to verify ODBC driver, auth mode, Databricks configuration and environment." />
+                <Empty text="Run diagnostics to verify PostgreSQL connection, auth mode, Databricks configuration and environment." />
               )}
             </Panel>
           )}

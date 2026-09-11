@@ -120,6 +120,43 @@ def test_contract_and_summary_report_real_deterministic_coverage():
     assert summary["deterministic_coverage_pct"] == 60.0
 
 
+def test_registry_covers_postgres_type_families():
+    cases = {
+        "bool": "BOOLEAN",
+        "boolean": "BOOLEAN",
+        "int2": "INTEGER",
+        "int4": "INTEGER",
+        "int8": "INTEGER",
+        "serial": "INTEGER",
+        "bigserial": "INTEGER",
+        "numeric": "DECIMAL",
+        "float4": "FLOAT",
+        "float8": "FLOAT",
+        "double precision": "FLOAT",
+        "character varying": "STRING",
+        "text": "STRING",
+        "json": "STRING",
+        "jsonb": "STRING",
+        "uuid": "UUID",
+        "bytea": "BINARY",
+        "timestamptz": "DATETIME",
+        "timestamp with time zone": "DATETIME",
+        "timestamp without time zone": "DATETIME",
+    }
+    for dtype, family in cases.items():
+        assert adapter_spec(dtype).family == family
+
+
+def test_postgres_source_select_expressions():
+    c_bytea = col("data", "bytea")
+    expr = source_select_expression(c_bytea, "POSTGRESQL")
+    assert "encode(\"data\", 'hex')" in expr
+
+    c_uuid = col("id", "uuid")
+    expr = source_uuid = source_select_expression(c_uuid, "POSTGRESQL")
+    assert '"id"::text' in expr
+
+
 def test_catalog_is_registry_driven_and_has_unknown_policy():
     rows = compatibility_catalog()
     ids = {r["adapter_id"] for r in rows}

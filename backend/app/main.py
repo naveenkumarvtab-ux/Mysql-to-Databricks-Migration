@@ -49,5 +49,9 @@ app.include_router(connector_router)
 def root_health(): return {"status":"ok","service":"migration-factory"}
 
 frontend_dir = Path("/app/frontend_dist")
+if not frontend_dir.exists():
+    frontend_dir = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+if not frontend_dir.exists():
+    frontend_dir = Path(__file__).resolve().parents[2] / "frontend_dist"
 if frontend_dir.exists():
     app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")

@@ -9,7 +9,11 @@ from app.core.security import hash_password, verify_password, create_access_toke
 from app.models.entities import *
 from app.models.canonical import MigrationDeployment, MigrationRunStep, MigrationValidation, MigrationReconciliation, MigrationReconciliationDetail
 from app.services.engine import *
-from app.services.discovery import discover_sqlserver, test_sqlserver_connection
+from app.services.discovery import (
+    discover_sqlserver, test_sqlserver_connection,
+    discover_postgres, test_postgres_connection,
+    discover_source, test_source_connection,
+)
 from app.services.source_connector import connector_info, request as connector_request
 from app.core.config import get_settings
 from app.services.databricks_client import execute_sql
@@ -141,12 +145,29 @@ def _dev_log_rows(db: Session, project_id: str) -> list[dict]:
     return _environment_log_rows(db,project_id,"DEV")
 
 
-def _sqlserver_conn_for_source(src: MigrationSource) -> str:
-    cfg=get_settings()
-    driver=cfg.sqlserver_driver.replace("{","").replace("}","")
+def _source_conn_for_source(src: MigrationSource) -> tuple[Any, str]:
+    cfg = get_settings()
+    is_pg = cfg.source_type.upper() == "POSTGRESQL" or (src.server_name and ":" in src.server_name) or (cfg.postgres_host and not cfg.sqlserver_host)
+    if is_pg:
+        host = cfg.postgres_host or src.server_name or "localhost"
+        port = cfg.postgres_port or 5432
+        db = src.database_name or cfg.postgres_database or "postgres"
+        user = cfg.postgres_username or "postgres"
+        pwd = cfg.postgres_password or ""
+        sslmode = cfg.postgres_sslmode or "prefer"
+        return {
+            "host": host, "port": port, "dbname": db,
+            "user": user, "password": pwd, "sslmode": sslmode
+        }, "POSTGRESQL"
+    driver = cfg.sqlserver_driver.replace("{", "").replace("}", "")
     if cfg.sqlserver_username:
-        return f"DRIVER={{{driver}}};SERVER={src.server_name};DATABASE={src.database_name};UID={cfg.sqlserver_username};PWD={cfg.sqlserver_password or ''};TrustServerCertificate=yes;"
-    return f"DRIVER={{{driver}}};SERVER={src.server_name};DATABASE={src.database_name};Trusted_Connection=yes;TrustServerCertificate=yes;"
+        return f"DRIVER={{{driver}}};SERVER={src.server_name};DATABASE={src.database_name};UID={cfg.sqlserver_username};PWD={cfg.sqlserver_password or ''};TrustServerCertificate=yes;", "SQLSERVER"
+    return f"DRIVER={{{driver}}};SERVER={src.server_name};DATABASE={src.database_name};Trusted_Connection=yes;TrustServerCertificate=yes;", "SQLSERVER"
+
+
+def _sqlserver_conn_for_source(src: MigrationSource) -> str:
+    conn, _ = _source_conn_for_source(src)
+    return conn if isinstance(conn, str) else str(conn)
 
 
 def auth(authorization: str|None=Header(default=None)):
@@ -193,8 +214,9 @@ def source_test(project_id:str,source_id:str,db:Session=Depends(get_db),_=Depend
     src=db.get(MigrationSource,source_id)
     if not src or src.project_id!=project_id: raise HTTPException(404,"Source not found in project")
     try:
+        conn, stype = _source_conn_for_source(src)
         result = (connector_request(src.id, "test") if connector_info(src.id)["mode"] == "CONNECTOR"
-                  else test_sqlserver_connection(_sqlserver_conn_for_source(src)))
+                  else test_source_connection(conn, stype))
         result.update({"profile_name":src.profile_name,"server_name":src.server_name,"database_name":src.database_name})
         return result
     except Exception as e:
@@ -204,14 +226,14 @@ def source_test(project_id:str,source_id:str,db:Session=Depends(get_db),_=Depend
 def discovery_live(project_id:str,source_id:str,db:Session=Depends(get_db),_=Depends(auth)):
     src=db.get(MigrationSource,source_id)
     if not src or src.project_id!=project_id: raise HTTPException(404,"Source not found in project")
-    conn=_sqlserver_conn_for_source(src)
+    conn, stype = _source_conn_for_source(src)
     try:
         if connector_info(src.id)["mode"] == "CONNECTOR":
             connector_request(src.id, "test")
             snap = connector_request(src.id, "discover")
         else:
-            test_sqlserver_connection(conn)
-            snap=discover_sqlserver(conn)
+            test_source_connection(conn, stype)
+            snap = discover_source(conn, stype)
         return {"counts":ingest_snapshot(db,project_id,source_id,snap),"database":snap.get("database"),"objects":len(snap.get("objects",[]))}
     except Exception as e:
         raise HTTPException(400,f"Discovery failed: {e}")
