@@ -10,7 +10,13 @@ export async function api<T>(path:string,init:RequestInit={}):Promise<T>{
     localStorage.removeItem('mf_token');
     window.dispatchEvent(new Event('auth_expired'));
   }
-  if(!r.ok)throw new Error(payload.detail||r.statusText);
+  if (!r.ok) {
+    let message: any = payload?.detail ?? payload?.error ?? payload?.message ?? r.statusText;
+    if (typeof message === "object" && message !== null) {
+      message = message.error || message.message || (message.failed_target ? `[${message.failed_target}] ${message.error || JSON.stringify(message)}` : JSON.stringify(message));
+    }
+    throw new Error(String(message || r.statusText));
+  }
   return payload as T;
 }
 export async function downloadApi(path:string,filenameFallback='migration-log.csv'){

@@ -1243,8 +1243,8 @@ export default function App() {
         </header>
         <section className="content">
           {msg && (
-            <div className={msg.includes("success") ? "notice ok" : "notice"}>
-              {msg}
+            <div className={typeof msg === "string" && msg.includes("success") ? "notice ok" : "notice"}>
+              {typeof msg === "string" ? msg : JSON.stringify(msg)}
             </div>
           )}
           {page === "Migration Workflow" && (
@@ -4406,6 +4406,12 @@ export default function App() {
                   <div className="summary-stat"><span>Failed</span><b>{testPromotion?.failed ?? 0}</b></div>
                   <div className="summary-stat"><span>TEST gate</span><Badge s={testGate?.status || (environmentPassed("TEST") ? "PASSED" : "NOT_STARTED")} /></div>
                 </div>
+                {testPromotion?.status === "FAILED" && (
+                  <div className="notice" style={{ marginTop: 12, borderColor: "var(--red, #ef4444)" }}>
+                    <strong>TEST Deployment Failed:</strong>{" "}
+                    {testPromotion.error || testPromotion.logs?.find((l: any) => l.status === "FAILED" && l.error)?.error || testPromotion.checkpoint || testPromotion.failed_object || "Check the execution evidence logs below."}
+                  </div>
+                )}
                 {testPrecheck && (
                   <div className="subsection">
                     <h4>TEST promotion precheck</h4>
@@ -4453,7 +4459,10 @@ export default function App() {
                       <tr key={i}>
                         <td>{x.created_at ? new Date(x.created_at).toLocaleString() : "-"}</td>
                         <td><Badge s={x.status} /></td>
-                        <td><code>{x.target_fqn || x.action || "-"}</code></td>
+                        <td>
+                          <code>{x.target_fqn || x.action || "-"}</code>
+                          {x.error && <div style={{ color: "var(--red, #ef4444)", fontSize: "0.85em", marginTop: 4, whiteSpace: "pre-wrap" }}>{x.error}</div>}
+                        </td>
                         <td>{x.artifact_version ? `v${x.artifact_version}` : "-"}</td>
                       </tr>
                     ))}</tbody>
@@ -4520,6 +4529,12 @@ export default function App() {
                   <div className="summary-stat"><span>Failed</span><b>{uatPromotion?.failed ?? 0}</b></div>
                   <div className="summary-stat"><span>UAT gate</span><Badge s={uatGate?.status || (environmentPassed("UAT") ? "PASSED" : "NOT_STARTED")} /></div>
                 </div>
+                {uatPromotion?.status === "FAILED" && (
+                  <div className="notice" style={{ marginTop: 12, borderColor: "var(--red, #ef4444)" }}>
+                    <strong>UAT Deployment Failed:</strong>{" "}
+                    {uatPromotion.error || uatPromotion.logs?.find((l: any) => l.status === "FAILED" && l.error)?.error || uatPromotion.checkpoint || uatPromotion.failed_object || "Check the execution evidence logs below."}
+                  </div>
+                )}
                 {uatPrecheck && (
                   <div className="subsection">
                     <h4>UAT promotion precheck</h4>
@@ -4568,7 +4583,10 @@ export default function App() {
                       <tr key={i}>
                         <td>{x.created_at ? new Date(x.created_at).toLocaleString() : "-"}</td>
                         <td><Badge s={x.status} /></td>
-                        <td><code>{x.target_fqn || x.action || "-"}</code></td>
+                        <td>
+                          <code>{x.target_fqn || x.action || "-"}</code>
+                          {x.error && <div style={{ color: "var(--red, #ef4444)", fontSize: "0.85em", marginTop: 4, whiteSpace: "pre-wrap" }}>{x.error}</div>}
+                        </td>
                         <td>{x.artifact_version ? `v${x.artifact_version}` : "-"}</td>
                       </tr>
                     ))}</tbody>
@@ -4621,6 +4639,12 @@ export default function App() {
                   <div className="summary-stat"><span>Failed</span><b>{prodPromotion?.failed ?? 0}</b></div>
                   <div className="summary-stat"><span>PROD gate</span><Badge s={prodGate?.status || (environmentPassed("PROD") ? "PASSED" : "NOT_STARTED")} /></div>
                 </div>
+                {prodPromotion?.status === "FAILED" && (
+                  <div className="notice" style={{ marginTop: 12, borderColor: "var(--red, #ef4444)" }}>
+                    <strong>PROD Deployment Failed:</strong>{" "}
+                    {prodPromotion.error || prodPromotion.logs?.find((l: any) => l.status === "FAILED" && l.error)?.error || prodPromotion.checkpoint || prodPromotion.failed_object || "Check the execution evidence logs below."}
+                  </div>
+                )}
                 {prodPrecheck && <div className="subsection"><h4>PROD promotion precheck</h4><pre>{JSON.stringify(prodPrecheck, null, 2)}</pre></div>}
                 {prodRecon?.run_id && (
                   <div className="subsection">
@@ -4656,7 +4680,10 @@ export default function App() {
                       <tr key={i}>
                         <td>{x.created_at ? new Date(x.created_at).toLocaleString() : "-"}</td>
                         <td><Badge s={x.status} /></td>
-                        <td><code>{x.target_fqn || x.action || "-"}</code></td>
+                        <td>
+                          <code>{x.target_fqn || x.action || "-"}</code>
+                          {x.error && <div style={{ color: "var(--red, #ef4444)", fontSize: "0.85em", marginTop: 4, whiteSpace: "pre-wrap" }}>{x.error}</div>}
+                        </td>
                         <td>{x.artifact_version ? `v${x.artifact_version}` : "-"}</td>
                       </tr>
                     ))}</tbody>

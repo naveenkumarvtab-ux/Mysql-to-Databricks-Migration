@@ -206,6 +206,14 @@ def _parse_target_fqn(fqn: str) -> tuple[str, str, str]:
     return parts[0], parts[1], parts[2]
 
 
+def _safe_create_catalog_and_schema(catalog: str, schema: str) -> None:
+    try:
+        execute_sql(f"CREATE CATALOG IF NOT EXISTS `{catalog}`", safe_retry=False)
+    except Exception:
+        pass
+    execute_sql(f"CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{schema}`", safe_retry=False)
+
+
 def _expected_schema(db: Session, project_id: str, object_id: str) -> list[dict[str, str]]:
     from app.services.rules import map_sqlserver_type
     cols = db.scalars(select(MigrationColumn).where(
@@ -589,7 +597,7 @@ def deploy_dev(db: Session, project_id: str, *, allow_destructive: bool = False,
                 )
             catalog, schema, _ = _parse_target_fqn(mapping.target_fqn)
             failure_stage = "TARGET_SCHEMA"
-            execute_sql(f"CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{schema}`", safe_retry=False)
+            _safe_create_catalog_and_schema(catalog, schema)
             if object_id in completed_ids:
                 results.append({"object_id": object_id, "name": obj.object_name, "status": "SKIPPED_ALREADY_PASSED"})
                 continue
@@ -1100,7 +1108,7 @@ def promote_medallion_to_test(db: Session, project_id: str) -> dict[str, Any]:
             target_fqn = _replace_catalog(source_fqn, cfg.dev_catalog, cfg.test_catalog)
             failed_target = target_fqn
             catalog, schema, _ = _parse_target_fqn(target_fqn)
-            execute_sql(f"CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{schema}`", safe_retry=False)
+            _safe_create_catalog_and_schema(catalog, schema)
             owner = _target_owner_collision(db, project_id, target_fqn)
             if owner:
                 raise RuntimeError(
@@ -1257,7 +1265,7 @@ def promote_medallion_to_uat(db: Session, project_id: str) -> dict[str, Any]:
             target_fqn = _replace_catalog(source_fqn, cfg.test_catalog, cfg.uat_catalog)
             failed_target = target_fqn
             catalog, schema, _ = _parse_target_fqn(target_fqn)
-            execute_sql(f"CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{schema}`", safe_retry=False)
+            _safe_create_catalog_and_schema(catalog, schema)
             owner = _target_owner_collision(db, project_id, target_fqn)
             if owner:
                 raise RuntimeError(
@@ -1416,7 +1424,7 @@ def promote_medallion_to_prod(db: Session, project_id: str) -> dict[str, Any]:
             target_fqn = _replace_catalog(source_fqn, cfg.uat_catalog, cfg.prod_catalog)
             failed_target = target_fqn
             catalog, schema, _ = _parse_target_fqn(target_fqn)
-            execute_sql(f"CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{schema}`", safe_retry=False)
+            _safe_create_catalog_and_schema(catalog, schema)
             owner = _target_owner_collision(db, project_id, target_fqn)
             if owner:
                 raise RuntimeError(

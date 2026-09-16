@@ -838,7 +838,11 @@ def test_promotion_precheck_api(project_id:str,db:Session=Depends(get_db),_=Depe
 def test_promotion_deploy_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
     try:
         result=promote_medallion_to_test(db,project_id)
-        if result.get("status")=="FAILED": raise HTTPException(400,result)
+        if result.get("status")=="FAILED":
+            err = result.get("error") or "TEST promotion failed"
+            if result.get("failed_target"):
+                err = f"[{result['failed_target']}] {err}"
+            raise HTTPException(400, err)
         return result
     except ValueError as e: raise HTTPException(400,str(e))
 
@@ -885,7 +889,11 @@ def uat_promotion_precheck_api(project_id:str,db:Session=Depends(get_db),_=Depen
 def uat_promotion_deploy_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
     try:
         result=promote_medallion_to_uat(db,project_id)
-        if result.get("status")=="FAILED": raise HTTPException(400,result)
+        if result.get("status")=="FAILED":
+            err = result.get("error") or "UAT promotion failed"
+            if result.get("failed_target"):
+                err = f"[{result['failed_target']}] {err}"
+            raise HTTPException(400, err)
         return result
     except ValueError as e: raise HTTPException(400,str(e))
 
@@ -932,7 +940,11 @@ def prod_promotion_precheck_api(project_id:str,db:Session=Depends(get_db),_=Depe
 def prod_promotion_deploy_api(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
     try:
         result=promote_medallion_to_prod(db,project_id)
-        if result.get("status")=="FAILED": raise HTTPException(400,result)
+        if result.get("status")=="FAILED":
+            err = result.get("error") or "PROD promotion failed"
+            if result.get("failed_target"):
+                err = f"[{result['failed_target']}] {err}"
+            raise HTTPException(400, err)
         return result
     except ValueError as e: raise HTTPException(400,str(e))
 
