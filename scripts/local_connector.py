@@ -1,4 +1,4 @@
-# Local connector agent for PostgreSQL / SQL Server data source introspection and streaming.
+# Local connector agent for MySQL / PostgreSQL / SQL Server data source introspection and streaming.
 import argparse
 from datetime import date, datetime, time as time_type
 from decimal import Decimal
@@ -20,14 +20,18 @@ from app.services.discovery import (
     discover_source,
     test_source_connection,
     connection_diagnostic,
+    _get_mysql_connection,
 )
 from app.services.type_compatibility import source_select_expression
 
 
-def quoted(value, is_postgres=True):
+def quoted(value, db_type="mysql"):
     if not isinstance(value, str) or not value or len(value) > 128 or "\x00" in value:
         raise ValueError("Invalid SQL identifier")
-    if is_postgres:
+    db = str(db_type).lower()
+    if db == "mysql":
+        return '`' + value.replace('`', '``') + '`'
+    if db in {"postgresql", "postgres"}:
         return '"' + value.replace('"', '""') + '"'
     return "[" + value.replace("]", "]]") + "]"
 
@@ -49,14 +53,28 @@ def encode_value(value):
 
 
 class LocalAgent:
-    def __init__(self, source_id, server, database, connection_info, is_postgres=True):
+    def __init__(self, source_id, server, database, connection_info, db_type=None, is_postgres=None):
         self.source_id, self.server, self.database = source_id, server, database
         self.connection_info = connection_info
-        self.is_postgres = is_postgres
+        if db_type is not None:
+            self.db_type = db_type.lower()
+        elif is_postgres is not None:
+            self.db_type = "postgresql" if is_postgres else "sqlserver"
+        elif isinstance(connection_info, dict) and ("dbname" in connection_info or "sslmode" in connection_info):
+            self.db_type = "postgresql"
+        elif isinstance(connection_info, str) and ("DRIVER=" in connection_info.upper() or "SERVER=" in connection_info.upper() or connection_info == "secret"):
+            self.db_type = "sqlserver"
+        else:
+            self.db_type = "mysql"
         self.streams = {}
 
     def connect(self):
-        if self.is_postgres:
+        if self.db_type == "mysql":
+            if isinstance(self.connection_info, dict):
+                return _get_mysql_connection(self.connection_info)
+            from app.services.discovery import parse_mysql_conn
+            return _get_mysql_connection(parse_mysql_conn(self.connection_info))
+        elif self.db_type in {"postgresql", "postgres"}:
             import psycopg2
             if isinstance(self.connection_info, dict):
                 return psycopg2.connect(**self.connection_info)
@@ -84,7 +102,7 @@ class LocalAgent:
 
     def cleanup(self, all_streams=False):
         for key, item in list(self.streams.items()):
-            if all_streams or time.monotonic() - item[2] > 150:
+            if all_streams or time.monotonic() - item[2] > 600:
                 try:
                     item[0].close()
                 finally:
@@ -130,14 +148,45 @@ class LocalAgent:
         if op not in {"count", "open"}:
             raise ValueError("Unsupported operation")
 
-        schema, table = data.get("schema", "public"), data.get("table")
-        table_sql = f"{quoted(schema, self.is_postgres)}.{quoted(table, self.is_postgres)}"
+        schema = data.get("schema") or self.database or "public"
+        table = data.get("table")
+        table_sql = f"{quoted(schema, self.db_type)}.{quoted(table, self.db_type)}" if schema else quoted(table, self.db_type)
         if len(self.streams) >= 4 and op == "open":
             raise ValueError("Connector stream capacity reached")
         conn = self.connect()
         try:
             cur = conn.cursor()
-            if self.is_postgres:
+            if self.db_type == "mysql":
+                cur.execute(
+                    "SELECT 1 FROM information_schema.tables WHERE table_schema=%s AND table_name=%s",
+                    (schema, table),
+                )
+                if not cur.fetchone():
+                    raise ValueError(f"Source table '{schema}.{table}' not found or read permission missing")
+                if op == "count":
+                    cur.execute(f"SELECT COUNT(*) FROM {table_sql}")
+                    row = cur.fetchone()
+                    return {"count": int(row[0]) if row else 0}
+                cur.execute(
+                    "SELECT column_name, data_type, numeric_precision, numeric_scale "
+                    "FROM information_schema.columns WHERE table_schema=%s AND table_name=%s",
+                    (schema, table),
+                )
+                metadata = cur.fetchall()
+                columns = {
+                    r[0]: SimpleNamespace(
+                        column_name=r[0], data_type=r[1], precision=r[2], scale=r[3]
+                    )
+                    for r in metadata
+                }
+                requested = data.get("columns")
+                if not isinstance(requested, list) or not requested or any(name not in columns for name in requested):
+                    raise ValueError("Source columns changed; repeat discovery before deployment")
+                limit = data.get("max_rows")
+                limit_clause = f" LIMIT {int(limit)}" if limit is not None and isinstance(limit, int) and limit > 0 else ""
+                projection = ", ".join(source_select_expression(columns[name], "MYSQL") for name in requested)
+                cur.execute(f"SELECT {projection} FROM {table_sql}{limit_clause}")
+            elif self.db_type in {"postgresql", "postgres"}:
                 cur.execute(
                     "SELECT 1 FROM information_schema.tables WHERE table_schema=%s AND table_name=%s",
                     (schema, table),
@@ -164,7 +213,7 @@ class LocalAgent:
                     raise ValueError("Source columns changed; repeat discovery before deployment")
                 limit = data.get("max_rows")
                 limit_clause = f" LIMIT {int(limit)}" if limit is not None and isinstance(limit, int) and limit > 0 else ""
-                projection = ", ".join(source_select_expression(columns[name]) for name in requested)
+                projection = ", ".join(source_select_expression(columns[name], "POSTGRESQL") for name in requested)
                 cur.execute(f"SELECT {projection} FROM {table_sql}{limit_clause}")
             else:
                 found = cur.execute(
@@ -194,7 +243,7 @@ class LocalAgent:
                     raise ValueError("Source columns changed; repeat discovery before deployment")
                 limit = data.get("max_rows")
                 top = f"TOP ({limit}) " if limit is not None else ""
-                projection = ",".join(source_select_expression(columns[name]) for name in requested)
+                projection = ",".join(source_select_expression(columns[name], "SQLSERVER") for name in requested)
                 cur.execute("SELECT " + top + projection + " FROM " + table_sql)
 
             stream_id = secrets.token_hex(24)
@@ -208,8 +257,8 @@ class LocalAgent:
 
 def validate_url(url):
     parts = urlsplit(url)
-    if not parts.hostname or parts.username or parts.password or parts.query or parts.fragment:
-        raise ValueError("Connector requires an application URL without embedded credentials or query parameters")
+    if not parts.hostname or parts.username or parts.password or parts.query or parts.fragment or (parts.scheme == "http" and parts.hostname not in {"localhost", "127.0.0.1"}):
+        raise ValueError("Connector requires an HTTPS application URL without embedded credentials (or http for localhost)")
     return url.rstrip("/") + "/api"
 
 
@@ -219,8 +268,9 @@ def main():
     parser.add_argument("--source", required=True)
     parser.add_argument("--server", required=True)
     parser.add_argument("--database", required=True)
-    parser.add_argument("--port", type=int, default=5432)
-    parser.add_argument("--sslmode", default="prefer")
+    parser.add_argument("--port", type=int, default=3306)
+    parser.add_argument("--source-type", default="mysql")
+    parser.add_argument("--sslmode", default=None)
     parser.add_argument("--driver", default=None)
     parser.add_argument("--username", default=None)
     parser.add_argument("--trust-server-certificate", action="store_true")
@@ -229,20 +279,35 @@ def main():
     base = validate_url(args.url)
     token = os.environ.get("CONNECTOR_TOKEN") or getpass.getpass("Connector registration token: ")
 
-    is_postgres = args.driver is None or "sql server" not in args.driver.lower()
-    if is_postgres:
+    source_type = (args.source_type or ("sqlserver" if args.driver and "sql server" in args.driver.lower() else "mysql")).lower()
+    
+    if source_type == "mysql":
+        user = args.username or os.environ.get("MYSQL_USERNAME") or "root"
+        password = os.environ.get("CONNECTOR_MYSQL_PASSWORD") or os.environ.get("MYSQL_PASSWORD")
+        if password is None:
+            password = getpass.getpass(f"MySQL password for '{user}': ")
+        connection_info = {
+            "host": args.server,
+            "port": args.port or 3306,
+            "database": args.database,
+            "user": user,
+            "password": password,
+        }
+        db_type = "MySQL"
+    elif source_type in {"postgresql", "postgres"}:
         user = args.username or os.environ.get("POSTGRES_USERNAME") or "postgres"
         password = os.environ.get("CONNECTOR_PG_PASSWORD") or os.environ.get("POSTGRES_PASSWORD")
         if password is None:
             password = getpass.getpass(f"PostgreSQL password for '{user}': ")
         connection_info = {
             "host": args.server,
-            "port": args.port,
+            "port": args.port or 5432,
             "dbname": args.database,
             "user": user,
             "password": password,
-            "sslmode": args.sslmode,
+            "sslmode": args.sslmode or "prefer",
         }
+        db_type = "PostgreSQL"
     else:
         credentials = "Trusted_Connection=yes;"
         if args.username:
@@ -251,16 +316,16 @@ def main():
                 password = getpass.getpass("SQL Server password: ")
             credentials = f"UID={args.username};PWD={password};"
         connection_info = (
-            f"DRIVER={{{args.driver}}};SERVER={{{args.server}}};"
+            f"DRIVER={{{args.driver or 'ODBC Driver 18 for SQL Server'}}};SERVER={{{args.server}}};"
             f"DATABASE={{{args.database}}};{credentials}Encrypt=yes;"
             f"TrustServerCertificate={'yes' if args.trust_server_certificate else 'no'};"
         )
+        db_type = "SQL Server"
 
-    agent = LocalAgent(args.source, args.server, args.database, connection_info, is_postgres=is_postgres)
+    agent = LocalAgent(args.source, args.server, args.database, connection_info, db_type=source_type)
     import httpx
     stopped = threading.Event()
     instance_id = secrets.token_hex(16)
-    db_type = "PostgreSQL" if is_postgres else "SQL Server"
     print(f"{db_type} connector started. Keep this process running; database credentials stay on this machine.")
     try:
         with httpx.Client(headers={"Authorization": "Bearer " + token, "X-Connector-Instance": instance_id}, timeout=30, follow_redirects=False) as client:

@@ -2,28 +2,33 @@ from __future__ import annotations
 import re
 
 TYPE_MAP = {
-    # SQL Server & PostgreSQL Integer Types
-    "bigint": "BIGINT", "int": "INT", "integer": "INT", "smallint": "SMALLINT", "tinyint": "SMALLINT",
+    # MySQL, SQL Server & PostgreSQL Integer Types
+    "bigint": "BIGINT", "int": "INT", "integer": "INT", "mediumint": "INT",
+    "smallint": "SMALLINT", "tinyint": "SMALLINT",
     "int2": "SMALLINT", "int4": "INT", "int8": "BIGINT",
     "serial": "INT", "bigserial": "BIGINT", "smallserial": "SMALLINT",
     "serial2": "SMALLINT", "serial4": "INT", "serial8": "BIGINT",
+    "year": "INT",
 
     # Boolean Types
     "bit": "BOOLEAN", "bool": "BOOLEAN", "boolean": "BOOLEAN",
 
     # Floating point & numeric
-    "float": "DOUBLE", "float4": "FLOAT", "float8": "DOUBLE", "real": "FLOAT",
-    "double precision": "DOUBLE", "double": "DOUBLE",
+    "float": "FLOAT", "float4": "FLOAT", "float8": "DOUBLE", "real": "FLOAT",
+    "double precision": "DOUBLE", "double": "DOUBLE", "dec": "DECIMAL", "fixed": "DECIMAL",
 
     # Character & Text Types
     "char": "STRING", "varchar": "STRING", "character varying": "STRING", "character": "STRING",
     "varchar2": "STRING", "nvarchar2": "STRING", "clob": "STRING", "nclob": "STRING",
-    "text": "STRING", "nchar": "STRING", "nvarchar": "STRING", "ntext": "STRING",
+    "text": "STRING", "tinytext": "STRING", "mediumtext": "STRING", "longtext": "STRING",
+    "nchar": "STRING", "nvarchar": "STRING", "ntext": "STRING",
     "citext": "STRING", "name": "STRING", "bpchar": "STRING",
+    "enum": "STRING", "set": "STRING",
 
     # Binary types
-    "blob": "BINARY", "binary": "BINARY", "varbinary": "BINARY", "image": "BINARY",
-    "bytea": "BINARY", "timestamp": "BINARY", "rowversion": "BINARY",
+    "blob": "BINARY", "tinyblob": "BINARY", "mediumblob": "BINARY", "longblob": "BINARY",
+    "binary": "BINARY", "varbinary": "BINARY", "image": "BINARY",
+    "bytea": "BINARY", "timestamp": "TIMESTAMP", "rowversion": "BINARY",
 
     # Date & Time types
     "date": "DATE", "datetime": "TIMESTAMP", "datetime2": "TIMESTAMP", "smalldatetime": "TIMESTAMP",
@@ -37,9 +42,59 @@ TYPE_MAP = {
     "json": "STRING", "jsonb": "STRING",
     "xml": "STRING", "datetimeoffset": "STRING", "sysname": "STRING", "hierarchyid": "STRING",
     "inet": "STRING", "cidr": "STRING", "macaddr": "STRING", "macaddr8": "STRING",
-    "tsvector": "STRING", "tsquery": "STRING", "point": "STRING", "line": "STRING",
-    "lseg": "STRING", "box": "STRING", "path": "STRING", "polygon": "STRING", "circle": "STRING"
+    "tsvector": "STRING", "tsquery": "STRING",
+    "geometry": "STRING", "point": "STRING", "linestring": "STRING", "polygon": "STRING",
+    "multipoint": "STRING", "multilinestring": "STRING", "multipolygon": "STRING",
+    "geometrycollection": "STRING", "lseg": "STRING", "box": "STRING", "path": "STRING", "circle": "STRING"
 }
+
+def map_mysql_type(name: str, precision: int | None = None, scale: int | None = None) -> str:
+    raw = name.lower().strip().replace('`', '').replace('"', '')
+    # Check for tinyint(1) boolean pattern in MySQL
+    if re.search(r"\btinyint\s*\(\s*1\s*\)", raw):
+        return "BOOLEAN"
+    # Unsigned handling
+    is_unsigned = "unsigned" in raw
+    clean = re.sub(r"\s+unsigned\b", "", raw)
+    clean = re.sub(r"\s+zerofill\b", "", clean)
+    
+    if is_unsigned:
+        if clean.startswith("bigint"):
+            return "DECIMAL(20,0)"
+        elif clean.startswith("int") or clean.startswith("integer") or clean.startswith("mediumint"):
+            return "BIGINT"
+        elif clean.startswith("smallint"):
+            return "INT"
+        elif clean.startswith("tinyint"):
+            return "SMALLINT"
+
+    # Enums & Sets
+    if clean.startswith("enum") or clean.startswith("set"):
+        return "STRING"
+
+    # Bit types: bit(1) -> BOOLEAN, bit(>1) -> BINARY
+    if clean.startswith("bit"):
+        m = re.search(r"bit\s*\(\s*(\d+)\s*\)", clean)
+        if m and m.group(1) == "1":
+            return "BOOLEAN"
+        elif m and int(m.group(1)) > 1:
+            return "BINARY"
+        return "BOOLEAN"
+
+    declared = re.fullmatch(r"([a-z0-9_ ]+)\s*\(\s*(max|\d+)\s*(?:,\s*(\d+)\s*)?\)", clean)
+    n = declared.group(1).strip() if declared else clean.split("(")[0].strip()
+
+    if n in {"decimal", "numeric", "dec", "fixed", "number"}:
+        declared_precision = int(declared.group(2)) if declared and declared.group(2).isdigit() else None
+        declared_scale = int(declared.group(3)) if declared and declared.group(3) else None
+        p = precision or declared_precision or 38
+        s = scale if scale is not None else (declared_scale or 0)
+        return f"DECIMAL({p},{s})"
+    if n in {"year"}:
+        return "INT"
+    if n in {"time"}:
+        return "STRING"
+    return TYPE_MAP.get(n, "STRING")
 
 def map_postgres_type(name: str, precision: int | None = None, scale: int | None = None) -> str:
     raw = name.lower().strip().replace('"', '')
@@ -63,10 +118,13 @@ def map_postgres_type(name: str, precision: int | None = None, scale: int | None
     return TYPE_MAP.get(n, "STRING")
 
 def map_sqlserver_type(name: str, precision: int | None = None, scale: int | None = None) -> str:
-    return map_postgres_type(name, precision, scale)
+    raw = name.lower().strip().replace('"', '').replace('[', '').replace(']', '')
+    if raw in {"timestamp", "rowversion"}:
+        return "BINARY"
+    return map_mysql_type(name, precision, scale)
 
 def map_source_type(name: str, precision: int | None = None, scale: int | None = None) -> str:
-    return map_postgres_type(name, precision, scale)
+    return map_mysql_type(name, precision, scale)
 
 def classify_layer(object_type: str, definition: str|None="", name: str="") -> tuple[str,float,str]:
     t = object_type.upper(); d=(definition or "").lower(); n=name.lower()

@@ -132,6 +132,9 @@ def test_bronze_loader_builds_binary_safe_source_and_target_sql(db, monkeypatch)
         def cursor(self):
             return SourceCursor()
 
+        def close(self):
+            pass
+
     class TargetCursor:
         def executemany(self, statement, payload):
             captured["insert_sql"] = statement
@@ -147,6 +150,8 @@ def test_bronze_loader_builds_binary_safe_source_and_target_sql(db, monkeypatch)
         def cursor(self):
             return TargetCursor()
 
+    from app.services import discovery
+    monkeypatch.setattr(discovery, "_get_mysql_connection", lambda *_a, **_k: SourceConnection())
     monkeypatch.setitem(sys.modules, "pyodbc", SimpleNamespace(connect=lambda *_a, **_k: SourceConnection()))
     monkeypatch.setattr(deployment, "databricks_connection", lambda: TargetConnection())
 
@@ -162,7 +167,8 @@ def test_bronze_loader_builds_binary_safe_source_and_target_sql(db, monkeypatch)
         replace_existing_data=False,
     )
 
-    assert "CONVERT(VARCHAR(MAX), CONVERT(VARBINARY(MAX), [VersionBytes]), 2) AS [VersionBytes]" in captured["source_sql"]
+    assert ("HEX(`VersionBytes`) AS `VersionBytes`" in captured["source_sql"] or
+            "CONVERT(VARCHAR(MAX), CONVERT(VARBINARY(MAX), [VersionBytes]), 2) AS [VersionBytes]" in captured["source_sql"])
     assert "VALUES (?,unhex(?),?, current_timestamp())" in captured["insert_sql"]
     assert captured["payload"][0][0] == 7
     assert captured["payload"][0][1] == "000000000000002a"

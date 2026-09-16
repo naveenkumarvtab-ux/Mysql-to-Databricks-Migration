@@ -377,7 +377,15 @@ def _apply_table_schema_policy(db: Session, project_id: str, obj: MigrationObjec
 
 def _source_connection_string(src: MigrationSource) -> str:
     cfg = get_settings()
-    if cfg.source_type.upper() == "POSTGRESQL" or (src.server_name and ":" in src.server_name) or cfg.postgres_host:
+    st = (cfg.source_type or "MYSQL").upper()
+    if st == "MYSQL" or cfg.mysql_host:
+        host = cfg.mysql_host or src.server_name or "localhost"
+        port = cfg.mysql_port or 3306
+        db = src.database_name or cfg.mysql_database or ""
+        user = cfg.mysql_username or "root"
+        pwd = cfg.mysql_password or ""
+        return f"mysql://{user}:{pwd}@{host}:{port}/{db}"
+    elif st in {"POSTGRESQL", "POSTGRES"} or (src.server_name and ":" in src.server_name) or cfg.postgres_host:
         host = cfg.postgres_host or src.server_name or "localhost"
         port = cfg.postgres_port or 5432
         db = src.database_name or cfg.postgres_database or "postgres"
@@ -400,7 +408,20 @@ def _source_rows(src, obj, cols, sql_text, max_rows):
             yield stream
     else:
         cfg = get_settings()
-        if cfg.source_type.upper() == "POSTGRESQL" or (cfg.postgres_host and not cfg.sqlserver_host):
+        st = (cfg.source_type or "MYSQL").upper()
+        if st == "MYSQL" or (cfg.mysql_host and not cfg.postgres_host and not cfg.sqlserver_host):
+            from app.services.discovery import parse_mysql_conn, _get_mysql_connection
+            conn_url = _source_connection_string(src)
+            conn_dict = parse_mysql_conn(conn_url)
+            conn = _get_mysql_connection(conn_dict)
+            try:
+                cursor = conn.cursor()
+                cursor.execute(sql_text)
+                yield cursor
+            finally:
+                if hasattr(conn, "close"):
+                    conn.close()
+        elif st in {"POSTGRESQL", "POSTGRES"} or (cfg.postgres_host and not cfg.sqlserver_host):
             try:
                 import psycopg2
             except ImportError:
@@ -414,7 +435,8 @@ def _source_rows(src, obj, cols, sql_text, max_rows):
                 cursor.execute(sql_text)
                 yield cursor
             finally:
-                conn.close()
+                if hasattr(conn, "close"):
+                    conn.close()
         else:
             import pyodbc
             with pyodbc.connect(_source_connection_string(src), timeout=30) as conn:
@@ -453,9 +475,19 @@ def load_bronze_table(db: Session, project_id: str, obj: MigrationObject, mappin
         return {"status": "PASSED", "rows": 0}
 
     cfg = get_settings()
-    is_pg = cfg.source_type.upper() == "POSTGRESQL" or (cfg.postgres_host and not cfg.sqlserver_host)
-    select_cols = ",".join(source_select_expression(c, "POSTGRESQL" if is_pg else "SQLSERVER") for c in cols)
-    if is_pg:
+    st = (cfg.source_type or "MYSQL").upper()
+    is_mysql = st == "MYSQL" or (cfg.mysql_host and not cfg.postgres_host and not cfg.sqlserver_host)
+    is_pg = st in {"POSTGRESQL", "POSTGRES"} or (cfg.postgres_host and not cfg.sqlserver_host and not cfg.mysql_host)
+    source_type_label = "MYSQL" if is_mysql else ("POSTGRESQL" if is_pg else "SQLSERVER")
+    select_cols = ",".join(source_select_expression(c, source_type_label) for c in cols)
+    if is_mysql:
+        clean_schema = obj.schema_name.replace('`', '``') if obj.schema_name else ""
+        clean_obj = obj.object_name.replace('`', '``')
+        source_table = f"`{clean_schema}`.`{clean_obj}`" if clean_schema else f"`{clean_obj}`"
+        sql_text = f"SELECT {select_cols} FROM {source_table}"
+        if max_rows:
+            sql_text += f" LIMIT {int(max_rows)}"
+    elif is_pg:
         clean_schema = obj.schema_name.replace('"', '""')
         clean_obj = obj.object_name.replace('"', '""')
         source_table = f'"{clean_schema}"."{clean_obj}"'
@@ -730,7 +762,23 @@ def _source_table_count(source: MigrationSource, obj: MigrationObject) -> int:
     if connector_info(source.id)["mode"] == "CONNECTOR":
         return int(connector_request(source.id, "count", {"schema": obj.schema_name, "table": obj.object_name})["count"])
     cfg = get_settings()
-    if cfg.source_type.upper() == "POSTGRESQL" or (cfg.postgres_host and not cfg.sqlserver_host):
+    st = (cfg.source_type or "MYSQL").upper()
+    if st == "MYSQL" or (cfg.mysql_host and not cfg.postgres_host and not cfg.sqlserver_host):
+        from app.services.discovery import parse_mysql_conn, _get_mysql_connection
+        conn_url = _source_connection_string(source)
+        conn_dict = parse_mysql_conn(conn_url)
+        conn = _get_mysql_connection(conn_dict)
+        try:
+            cur = conn.cursor()
+            clean_schema = obj.schema_name.replace('`', '``') if obj.schema_name else ""
+            clean_obj = obj.object_name.replace('`', '``')
+            tbl_name = f"`{clean_schema}`.`{clean_obj}`" if clean_schema else f"`{clean_obj}`"
+            cur.execute(f"SELECT COUNT(*) FROM {tbl_name}")
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+    elif st in {"POSTGRESQL", "POSTGRES"} or (cfg.postgres_host and not cfg.sqlserver_host):
         try:
             import psycopg2
         except ImportError:

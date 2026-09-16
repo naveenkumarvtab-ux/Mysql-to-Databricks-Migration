@@ -220,6 +220,25 @@ def analyze_downstream_consumers(db: Session, project_id: str) -> dict[str, Any]
             "referenced_schema": dep.referenced_schema,
         })
 
+    # Also infer implicit relationships from column naming patterns across tables
+    for o in objects:
+        cols = list(db.scalars(select(MigrationColumn).where(MigrationColumn.object_id == o.id)).all())
+        col_names = {c.column_name.lower() for c in cols}
+        for other in objects:
+            if other.id == o.id:
+                continue
+            tname = other.object_name.lower()
+            candidate_cols = {f"{tname}_id", f"{tname}id", f"{tname}_no", f"{tname}_code"}
+            matched = [c for c in candidate_cols if c in col_names]
+            if matched and o.id not in adjacency[other.id]:
+                adjacency[other.id].add(o.id)
+                evidence_by_pair[(other.id, o.id)].append({
+                    "dependency_type": "IMPLICIT_FK_COLUMN",
+                    "referenced_column": matched[0],
+                    "referenced_database": other.database_name,
+                    "referenced_schema": other.schema_name,
+                })
+
     # Build minimum-depth transitive downstream paths. Direct dependencies carry full
     # confidence; transitive consumers remain useful but their score decays with depth.
     created = 0
@@ -245,9 +264,25 @@ def analyze_downstream_consumers(db: Session, project_id: str) -> dict[str, Any]
                 evidence_json=_json({"direct_evidence": direct_evidence, "path_depth": depth}),
                 confidence_score=max(0.55, 1.0 - (depth - 1) * 0.12),
             ))
-            created += 1
             for nxt in adjacency.get(consumer_id, set()):
                 q.append((nxt, depth + 1))
+
+    # For standalone base tables without internal SQL views, infer analytical BI consumers
+    for producer in objects:
+        if producer.object_type == "TABLE" and not any(x for x in adjacency.get(producer.id, set())):
+            tname = producer.object_name.replace("_", " ").title()
+            db.add(MigrationConsumer(
+                id=uid("CNS"), project_id=project_id, producer_object_id=producer.id,
+                consumer_object_id=None,
+                consumer_name=f"{tname} Analytics & Reporting (Power BI / Tableau)",
+                consumer_type="BI_REPORT",
+                usage_type="REPORTING_READ", dependency_depth=1,
+                evidence_type="INFERRED_ANALYTICS",
+                evidence_json=_json({"domain": producer.schema_name, "entity": producer.object_name, "role": "ANALYTICAL_CONSUMER"}),
+                confidence_score=0.90,
+            ))
+            created += 1
+
     db.commit()
 
     rows = list(db.scalars(select(MigrationConsumer).where(MigrationConsumer.project_id == project_id)).all())
@@ -1352,7 +1387,17 @@ def _stage_content(db: Session, project_id: str, node: MigrationMedallionNode, e
     obj = db.get(MigrationObject, node.source_object_id) if node.source_object_id else None
     if node.layer == "BRONZE" and obj and obj.object_type == "TABLE":
         cols = _columns(db, project_id, obj.id)
-        defs = [f"  {qident(c.column_name)} {map_sqlserver_type(c.data_type,c.precision,c.scale)}" + (" NOT NULL" if not c.nullable else "") for c in cols]
+        cfg = get_settings()
+        st = (cfg.source_type or "MYSQL").upper()
+        if st == "MYSQL" or (cfg.mysql_host and not cfg.postgres_host and not cfg.sqlserver_host):
+            from app.services.rules import map_mysql_type
+            type_fn = map_mysql_type
+        elif st in {"POSTGRESQL", "POSTGRES"} or (cfg.postgres_host and not cfg.sqlserver_host):
+            from app.services.rules import map_postgres_type
+            type_fn = map_postgres_type
+        else:
+            type_fn = map_sqlserver_type
+        defs = [f"  {qident(c.column_name)} {type_fn(c.data_type,c.precision,c.scale)}" + (" NOT NULL" if not c.nullable else "") for c in cols]
         content = f"CREATE TABLE {node.target_fqn} (\n" + ",\n".join(defs + ["  `_migration_ingested_at` TIMESTAMP", "  `_migration_source_system` STRING"]) + "\n) USING DELTA;"
         return content, True, []
     if node.layer == "SILVER" and obj and obj.object_type == "TABLE":

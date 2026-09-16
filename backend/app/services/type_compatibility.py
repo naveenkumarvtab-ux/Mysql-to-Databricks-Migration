@@ -28,18 +28,18 @@ from uuid import UUID
 from .rules import map_sqlserver_type
 
 
-BINARY_SOURCE_TYPES = {"binary", "varbinary", "image", "timestamp", "rowversion", "bytea", "blob"}
+BINARY_SOURCE_TYPES = {"binary", "varbinary", "image", "timestamp", "rowversion", "bytea", "blob", "tinyblob", "mediumblob", "longblob"}
 INTEGER_SOURCE_TYPES = {
-    "bigint", "int", "integer", "smallint", "tinyint",
+    "bigint", "int", "integer", "mediumint", "smallint", "tinyint", "year",
     "int2", "int4", "int8", "serial", "bigserial", "smallserial",
     "serial2", "serial4", "serial8"
 }
 FLOAT_SOURCE_TYPES = {"float", "float4", "float8", "real", "double precision", "double"}
-DECIMAL_SOURCE_TYPES = {"decimal", "numeric", "money", "smallmoney", "number"}
+DECIMAL_SOURCE_TYPES = {"decimal", "numeric", "money", "smallmoney", "number", "dec", "fixed"}
 STRING_SOURCE_TYPES = {
-    "char", "varchar", "character varying", "character", "text", "nchar", "nvarchar",
-    "ntext", "sysname", "json", "jsonb", "citext", "name", "bpchar",
-    "uuid", "inet", "cidr", "macaddr", "macaddr8", "tsvector", "tsquery", "interval"
+    "char", "varchar", "character varying", "character", "text", "tinytext", "mediumtext", "longtext",
+    "nchar", "nvarchar", "ntext", "sysname", "json", "jsonb", "citext", "name", "bpchar",
+    "inet", "cidr", "macaddr", "macaddr8", "tsvector", "tsquery", "interval", "enum", "set"
 }
 DATE_SOURCE_TYPES = {"date"}
 DATETIME_SOURCE_TYPES = {
@@ -50,7 +50,10 @@ GOVERNED_TEXT_TYPES = {
     "time", "timetz", "time with time zone", "time without time zone",
     "datetimeoffset", "sql_variant", "xml", "hierarchyid"
 }
-SPATIAL_SOURCE_TYPES = {"geography", "geometry", "point", "line", "lseg", "box", "path", "polygon", "circle"}
+SPATIAL_SOURCE_TYPES = {
+    "geography", "geometry", "point", "line", "linestring", "lseg", "box",
+    "path", "polygon", "multipoint", "multilinestring", "multipolygon", "geometrycollection", "circle"
+}
 
 KNOWN_SOURCE_TYPES = (
     BINARY_SOURCE_TYPES
@@ -177,6 +180,10 @@ def normalize_source_type(name: str | None) -> str:
     return re.sub(r"\s*\(.*\)\s*$", "", text)
 
 
+def quote_mysql_identifier(name: str) -> str:
+    return "`" + name.replace("`", "``") + "`"
+
+
 def quote_postgres_identifier(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
@@ -185,8 +192,11 @@ def quote_sqlserver_identifier(name: str) -> str:
     return "[" + name.replace("]", "]]" ) + "]"
 
 
-def quote_identifier(name: str, source_type: str = "POSTGRESQL") -> str:
-    if source_type.upper() == "POSTGRESQL":
+def quote_identifier(name: str, source_type: str = "MYSQL") -> str:
+    st = (source_type or "MYSQL").upper()
+    if st == "MYSQL":
+        return quote_mysql_identifier(name)
+    elif st in {"POSTGRESQL", "POSTGRES"}:
         return quote_postgres_identifier(name)
     return quote_sqlserver_identifier(name)
 
@@ -230,26 +240,38 @@ def transport_plan(source_type: str, precision: int | None = None, scale: int | 
     )
 
 
-def source_select_expression(column: Any, source_type: str = "POSTGRESQL") -> str:
+def source_select_expression(column: Any, source_type: str = "SQLSERVER") -> str:
     """Return a source-side projection selected only from discovered metadata."""
     col_name = str(column.column_name)
-    is_pg = source_type.upper() == "POSTGRESQL"
-    quoted_name = quote_postgres_identifier(col_name) if is_pg else quote_sqlserver_identifier(col_name)
+    st = (source_type or "SQLSERVER").upper()
+    is_mysql = st == "MYSQL"
+    is_pg = st in {"POSTGRESQL", "POSTGRES"}
+    if is_mysql:
+        quoted_name = quote_mysql_identifier(col_name)
+    elif is_pg:
+        quoted_name = quote_postgres_identifier(col_name)
+    else:
+        quoted_name = quote_sqlserver_identifier(col_name)
+        
     plan = transport_plan(column.data_type, getattr(column, "precision", None), getattr(column, "scale", None))
     
     if plan.strategy == "HEX_STRING_TO_BINARY":
+        if is_mysql:
+            return f"HEX({quoted_name}) AS {quoted_name}"
         if is_pg:
-            # PostgreSQL bytea encode to hex
             return f"encode({quoted_name}, 'hex') AS {quoted_name}"
-        # SQL Server style 2 hex
         return f"CONVERT(VARCHAR(MAX), CONVERT(VARBINARY(MAX), {quoted_name}), 2) AS {quoted_name}"
     
     if plan.strategy == "UUID_STRING":
+        if is_mysql:
+            return f"CAST({quoted_name} AS CHAR) AS {quoted_name}"
         if is_pg:
             return f"{quoted_name}::text AS {quoted_name}"
         return f"CONVERT(VARCHAR(36), {quoted_name}) AS {quoted_name}"
         
     if plan.strategy in {"XML_STRING", "SQL_VARIANT_STRING", "GOVERNED_TEXT_FALLBACK"}:
+        if is_mysql:
+            return f"CAST({quoted_name} AS CHAR) AS {quoted_name}"
         if is_pg:
             return f"{quoted_name}::text AS {quoted_name}"
         return f"CONVERT(NVARCHAR(MAX), {quoted_name}) AS {quoted_name}"
@@ -258,6 +280,8 @@ def source_select_expression(column: Any, source_type: str = "POSTGRESQL") -> st
         return f"CASE WHEN {quoted_name} IS NULL THEN NULL ELSE {quoted_name}.ToString() END AS {quoted_name}"
         
     if plan.strategy == "SPATIAL_SRID_WKT_STRING":
+        if is_mysql:
+            return f"ST_AsText({quoted_name}) AS {quoted_name}"
         if is_pg:
             return f"{quoted_name}::text AS {quoted_name}"
         return (

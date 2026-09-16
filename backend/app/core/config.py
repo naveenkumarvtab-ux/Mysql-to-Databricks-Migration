@@ -8,7 +8,7 @@ ENV_FILE = ROOT_DIR / ".env"
 DEFAULT_DB = ROOT_DIR / "migration_factory.db"
 
 class Settings(BaseSettings):
-    app_name: str = "PostgreSQL to Databricks AI Migration Factory"
+    app_name: str = "MySQL to Databricks AI Migration Factory"
     environment: str = "DEV"
     database_url: str = f"sqlite:///{DEFAULT_DB.as_posix()}"
     jwt_secret: str = "change-me-in-production-minimum-32-characters"
@@ -18,9 +18,16 @@ class Settings(BaseSettings):
     bootstrap_admin_username: str | None = None
     bootstrap_admin_password: str | None = None
 
-    # Source Database Config (PostgreSQL & SQL Server compatibility)
-    source_type: str = "POSTGRESQL"
-    postgres_host: str | None = "localhost"
+    # Source Database Config (MySQL primary, PostgreSQL & SQL Server compatibility)
+    source_type: str = "MYSQL"
+    mysql_host: str | None = "localhost"
+    mysql_port: int = 3306
+    mysql_database: str | None = None
+    mysql_username: str | None = "root"
+    mysql_password: str | None = None
+    mysql_ssl_mode: str | None = "DISABLED"
+
+    postgres_host: str | None = None
     postgres_port: int = 5432
     postgres_database: str | None = None
     postgres_username: str | None = None

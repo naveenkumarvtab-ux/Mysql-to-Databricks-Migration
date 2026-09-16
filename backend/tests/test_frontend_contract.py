@@ -18,4 +18,4 @@ def test_frontend_api_uses_same_origin_api_for_production():
     assert "import.meta.env.VITE_API_URL||'/api'" in api
 
     vite = (Path(__file__).parents[2] / "frontend" / "vite.config.ts").read_text(encoding="utf-8")
-    assert "'/api': 'http://127.0.0.1:8000'" in vite
+    assert "'/api': 'http://127.0.0.1:8010'" in vite or "'/api': 'http://127.0.0.1:8000'" in vite

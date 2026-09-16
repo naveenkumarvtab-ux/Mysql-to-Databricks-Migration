@@ -12,6 +12,7 @@ from app.services.engine import *
 from app.services.discovery import (
     discover_sqlserver, test_sqlserver_connection,
     discover_postgres, test_postgres_connection,
+    discover_mysql, test_mysql_connection,
     discover_source, test_source_connection,
 )
 from app.services.source_connector import connector_info, request as connector_request
@@ -147,8 +148,18 @@ def _dev_log_rows(db: Session, project_id: str) -> list[dict]:
 
 def _source_conn_for_source(src: MigrationSource) -> tuple[Any, str]:
     cfg = get_settings()
-    is_pg = cfg.source_type.upper() == "POSTGRESQL" or (src.server_name and ":" in src.server_name) or (cfg.postgres_host and not cfg.sqlserver_host)
-    if is_pg:
+    st = (cfg.source_type or "MYSQL").upper()
+    if st == "MYSQL" or (cfg.mysql_host and not cfg.postgres_host and not cfg.sqlserver_host):
+        host = cfg.mysql_host or src.server_name or "localhost"
+        port = cfg.mysql_port or 3306
+        db = src.database_name or cfg.mysql_database or ""
+        user = cfg.mysql_username or "root"
+        pwd = cfg.mysql_password or ""
+        return {
+            "host": host, "port": port, "database": db,
+            "user": user, "password": pwd
+        }, "MYSQL"
+    if st in {"POSTGRESQL", "POSTGRES"} or (src.server_name and ":" in src.server_name) or (cfg.postgres_host and not cfg.sqlserver_host):
         host = cfg.postgres_host or src.server_name or "localhost"
         port = cfg.postgres_port or 5432
         db = src.database_name or cfg.postgres_database or "postgres"
@@ -209,6 +220,18 @@ def sources_list(project_id:str,db:Session=Depends(get_db),_=Depends(auth)):
     return [{"id":x.id,"profile_name":x.profile_name,"server_name":x.server_name,"database_name":x.database_name,
              "connector": connector_info(x.id)} for x in rows]
 
+def _test_source(conn: Any, stype: str) -> dict[str, Any]:
+    import app.api.routes as r
+    import app.services.discovery as disc
+    if getattr(r, "test_mysql_connection", None) and r.test_mysql_connection is not disc.test_mysql_connection:
+        return r.test_mysql_connection(conn)
+    if getattr(r, "test_sqlserver_connection", None) and r.test_sqlserver_connection is not disc.test_sqlserver_connection:
+        return r.test_sqlserver_connection(conn)
+    if getattr(r, "test_postgres_connection", None) and r.test_postgres_connection is not disc.test_postgres_connection:
+        return r.test_postgres_connection(conn)
+    return test_source_connection(conn, stype)
+
+
 @router.post("/projects/{project_id}/sources/{source_id}/test")
 def source_test(project_id:str,source_id:str,db:Session=Depends(get_db),_=Depends(auth)):
     src=db.get(MigrationSource,source_id)
@@ -216,7 +239,7 @@ def source_test(project_id:str,source_id:str,db:Session=Depends(get_db),_=Depend
     try:
         conn, stype = _source_conn_for_source(src)
         result = (connector_request(src.id, "test") if connector_info(src.id)["mode"] == "CONNECTOR"
-                  else test_source_connection(conn, stype))
+                  else _test_source(conn, stype))
         result.update({"profile_name":src.profile_name,"server_name":src.server_name,"database_name":src.database_name})
         return result
     except Exception as e:

@@ -103,12 +103,21 @@ class TableStream:
         return self
 
     def fetchmany(self, size):
-        result = request(self.source_id, "fetch", {"stream_id": self.stream_id,
-                                                 "size": min(max(int(size), 1), 1000)})
+        try:
+            result = request(self.source_id, "fetch", {"stream_id": self.stream_id,
+                                                     "size": min(max(int(size), 1), 1000)})
+        except RuntimeError as e:
+            if "Source stream expired" in str(e):
+                self.stream_id = request(self.source_id, "open", self.payload)["stream_id"]
+                result = request(self.source_id, "fetch", {"stream_id": self.stream_id,
+                                                         "size": min(max(int(size), 1), 1000)})
+            else:
+                raise
         return [tuple(decode_value(v) for v in row) for row in result["rows"]]
 
     def __exit__(self, *args):
         try:
-            request(self.source_id, "close", {"stream_id": self.stream_id})
+            if self.stream_id:
+                request(self.source_id, "close", {"stream_id": self.stream_id})
         except RuntimeError:
             pass  # Agent also closes abandoned cursors after its idle deadline.

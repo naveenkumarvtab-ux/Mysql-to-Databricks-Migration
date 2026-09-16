@@ -266,14 +266,26 @@ WHERE o.is_ms_shipped=0 AND o.type IN ('P','FN','IF','TF');
 
 def connection_diagnostic(error: Exception) -> str:
     message = str(error).lower()
+    # MySQL specific diagnostics
+    if "1045" in message or "access denied for user" in message:
+        return "AUTHENTICATION_FAILED: Verify MySQL username and password."
+    if "1049" in message or "unknown database" in message:
+        return "DATABASE_ACCESS: Verify the MySQL database name exists and user has access."
+    if "2003" in message or "can't connect to mysql server" in message or "connection refused" in message:
+        return "NETWORK_UNREACHABLE: The backend could not reach MySQL server. Verify MySQL is running on host/port (default: 3306)."
+    if "1044" in message:
+        return "DATABASE_ACCESS: Access denied for database. Check user database permissions."
+    # PostgreSQL specific diagnostics
     if "password authentication failed" in message or "28p01" in message:
         return "AUTHENTICATION_FAILED: Verify PostgreSQL username and password."
     if "database" in message and ("does not exist" in message or "3d000" in message):
         return "DATABASE_ACCESS: Verify the PostgreSQL database name exists and is accessible."
-    if "could not connect to server" in message or "connection refused" in message or "08001" in message:
+    if "could not connect to server" in message or "08001" in message:
         return "NETWORK_UNREACHABLE: The backend could not reach PostgreSQL host/port. Verify network, host, and port 5432."
     if "ssl" in message or "certificate" in message:
-        return "TLS_ERROR: Verify PostgreSQL SSL configuration and sslmode setting."
+        return "TLS_ERROR: Verify SSL configuration and sslmode setting."
+    if "hyt00" in message or "timeout" in message:
+        return "NETWORK_UNREACHABLE: Connection timeout expired. Verify server host and port."
     if "4060" in message or "cannot open database" in message:
         return "DATABASE_ACCESS: Verify the database name and grant connector read and metadata permissions."
     if "28000" in message or "login failed" in message or "18456" in message:
@@ -282,6 +294,439 @@ def connection_diagnostic(error: Exception) -> str:
         return "DRIVER_MISSING: Install required driver."
     return f"SOURCE_OPERATION_FAILED: {str(error)}"
 
+
+# ==============================================================================
+# MYSQL DISCOVERY IMPLEMENTATION
+# ==============================================================================
+
+def parse_mysql_conn(conn_info: Any) -> dict:
+    if isinstance(conn_info, dict):
+        cfg = dict(conn_info)
+        if "dbname" in cfg and "database" not in cfg:
+            cfg["database"] = cfg.pop("dbname")
+        if "username" in cfg and "user" not in cfg:
+            cfg["user"] = cfg.pop("username")
+        if "port" in cfg:
+            try:
+                cfg["port"] = int(cfg["port"])
+            except (ValueError, TypeError):
+                cfg["port"] = 3306
+        return cfg
+    s = str(conn_info).strip()
+    if s.startswith("mysql://") or s.startswith("mysql+pymysql://") or s.startswith("mysql+mysqlconnector://"):
+        u = urlparse(s)
+        return {
+            "host": u.hostname or "localhost",
+            "port": int(u.port or 3306),
+            "database": u.path.lstrip("/") if u.path else "",
+            "user": u.username or "root",
+            "password": u.password or "",
+        }
+    parts = s.split()
+    out = {}
+    for p in parts:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            out[k.strip()] = v.strip()
+    if "port" in out:
+        try:
+            out["port"] = int(out["port"])
+        except (ValueError, TypeError):
+            out["port"] = 3306
+    if "username" in out and "user" not in out:
+        out["user"] = out.pop("username")
+    if "dbname" in out and "database" not in out:
+        out["database"] = out.pop("dbname")
+    return out
+
+
+def _get_mysql_connection(cfg: dict):
+    # Try PyMySQL first, then mysql.connector
+    try:
+        import pymysql
+        conn_kwargs = {
+            "host": cfg.get("host", "localhost"),
+            "port": int(cfg.get("port", 3306)),
+            "user": cfg.get("user", "root"),
+            "password": cfg.get("password", ""),
+            "database": cfg.get("database") or None,
+            "charset": "utf8mb4",
+            "connect_timeout": 10,
+        }
+        return pymysql.connect(**conn_kwargs)
+    except ImportError:
+        try:
+            import mysql.connector
+            conn_kwargs = {
+                "host": cfg.get("host", "localhost"),
+                "port": int(cfg.get("port", 3306)),
+                "user": cfg.get("user", "root"),
+                "password": cfg.get("password", ""),
+                "database": cfg.get("database") or None,
+                "connection_timeout": 10,
+            }
+            return mysql.connector.connect(**conn_kwargs)
+        except ImportError as e:
+            raise RuntimeError("PyMySQL or mysql-connector-python is required for MySQL connectivity") from e
+
+
+def test_mysql_connection(conn_info: Any) -> dict[str, Any]:
+    cfg = parse_mysql_conn(conn_info)
+    try:
+        conn = _get_mysql_connection(cfg)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT DATABASE(), @@hostname, VERSION();")
+                row = cur.fetchone()
+                db_name = row[0] if row and row[0] else cfg.get("database", "")
+                server_addr = row[1] if row and row[1] else cfg.get("host", "localhost")
+                version = f"MySQL {row[2]}" if row and row[2] else "MySQL"
+                return {
+                    "ok": True,
+                    "server": server_addr or "localhost",
+                    "database": db_name or "",
+                    "product_version": version,
+                }
+        finally:
+            conn.close()
+    except Exception as e:
+        raise RuntimeError(connection_diagnostic(e)) from e
+
+
+def discover_mysql(conn_info: Any) -> dict[str, Any]:
+    cfg = parse_mysql_conn(conn_info)
+    db_target = cfg.get("database") or ""
+    try:
+        conn = _get_mysql_connection(cfg)
+        try:
+            with conn.cursor() as cur:
+                if not db_target:
+                    cur.execute("SELECT DATABASE();")
+                    row = cur.fetchone()
+                    db_target = row[0] if row and row[0] else ""
+
+                schema_filter = "TABLE_SCHEMA = %s" if db_target else "TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')"
+                schema_args = [db_target] if db_target else []
+
+                # 1. Objects: Tables & Views
+                tbl_query = f"""
+                SELECT
+                    TABLE_SCHEMA AS database_name,
+                    TABLE_SCHEMA AS schema_name,
+                    TABLE_NAME AS object_name,
+                    CASE TABLE_TYPE
+                        WHEN 'VIEW' THEN 'VIEW'
+                        ELSE 'TABLE'
+                    END AS object_type,
+                    VIEW_DEFINITION AS definition
+                FROM information_schema.TABLES
+                LEFT JOIN information_schema.VIEWS USING (TABLE_SCHEMA, TABLE_NAME)
+                WHERE {schema_filter};
+                """
+                cur.execute(tbl_query, schema_args)
+                obj_rows = cur.fetchall()
+
+                # Stored Routines (Procedures and Functions)
+                routine_filter = "ROUTINE_SCHEMA = %s" if db_target else "ROUTINE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')"
+                routine_query = f"""
+                SELECT
+                    ROUTINE_SCHEMA AS database_name,
+                    ROUTINE_SCHEMA AS schema_name,
+                    ROUTINE_NAME AS object_name,
+                    ROUTINE_TYPE AS object_type,
+                    ROUTINE_DEFINITION AS definition
+                FROM information_schema.ROUTINES
+                WHERE {routine_filter};
+                """
+                try:
+                    cur.execute(routine_query, schema_args)
+                    routine_rows = cur.fetchall()
+                except Exception:
+                    routine_rows = []
+
+                # Triggers
+                trigger_filter = "TRIGGER_SCHEMA = %s" if db_target else "TRIGGER_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')"
+                trigger_query = f"""
+                SELECT
+                    TRIGGER_SCHEMA AS database_name,
+                    TRIGGER_SCHEMA AS schema_name,
+                    TRIGGER_NAME AS object_name,
+                    'TRIGGER' AS object_type,
+                    ACTION_STATEMENT AS definition
+                FROM information_schema.TRIGGERS
+                WHERE {trigger_filter};
+                """
+                try:
+                    cur.execute(trigger_query, schema_args)
+                    trigger_rows = cur.fetchall()
+                except Exception:
+                    trigger_rows = []
+
+                all_objs = list(obj_rows) + list(routine_rows) + list(trigger_rows)
+                objs = [
+                    {
+                        "database_name": r[0], "schema_name": r[1],
+                        "object_name": r[2], "object_type": r[3], "definition": r[4]
+                    }
+                    for r in all_objs
+                ]
+
+                # 2. Columns
+                col_query = f"""
+                SELECT
+                    TABLE_SCHEMA AS schema_name,
+                    TABLE_NAME AS object_name,
+                    COLUMN_NAME AS column_name,
+                    ORDINAL_POSITION AS column_id,
+                    COLUMN_TYPE AS declared_data_type,
+                    DATA_TYPE AS system_data_type,
+                    0 AS is_user_defined,
+                    CHARACTER_MAXIMUM_LENGTH AS max_length,
+                    NUMERIC_PRECISION AS precision_val,
+                    NUMERIC_SCALE AS scale_val,
+                    CASE WHEN IS_NULLABLE = 'YES' THEN 1 ELSE 0 END AS is_nullable,
+                    CASE WHEN EXTRA LIKE '%%auto_increment%%' THEN 1 ELSE 0 END AS is_identity,
+                    CASE WHEN EXTRA LIKE '%%VIRTUAL%%' OR EXTRA LIKE '%%STORED%%' THEN 1 ELSE 0 END AS is_computed,
+                    COLUMN_DEFAULT AS default_definition,
+                    COLLATION_NAME AS collation_name
+                FROM information_schema.COLUMNS
+                WHERE {schema_filter}
+                ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION;
+                """
+                cur.execute(col_query, schema_args)
+                col_rows = cur.fetchall()
+                cols = [
+                    {
+                        "schema_name": r[0], "object_name": r[1], "column_name": r[2],
+                        "column_id": r[3], "declared_data_type": r[4], "system_data_type": r[5],
+                        "is_user_defined": bool(r[6]), "max_length": r[7], "precision": r[8],
+                        "scale": r[9], "is_nullable": bool(r[10]), "is_identity": bool(r[11]),
+                        "is_computed": bool(r[12]), "default_definition": r[13], "collation_name": r[14]
+                    }
+                    for r in col_rows
+                ]
+
+                # 3. Key Constraints (Primary Key & Unique)
+                kc_filter = "tc.TABLE_SCHEMA = %s" if db_target else "tc.TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')"
+                kc_query = f"""
+                SELECT
+                    tc.TABLE_SCHEMA AS schema_name,
+                    tc.TABLE_NAME AS object_name,
+                    tc.CONSTRAINT_NAME AS constraint_name,
+                    tc.CONSTRAINT_TYPE AS constraint_type,
+                    kcu.ORDINAL_POSITION AS key_ordinal,
+                    kcu.COLUMN_NAME AS column_name
+                FROM information_schema.TABLE_CONSTRAINTS tc
+                JOIN information_schema.KEY_COLUMN_USAGE kcu
+                  ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+                 AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA
+                 AND tc.TABLE_NAME = kcu.TABLE_NAME
+                WHERE {kc_filter}
+                  AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE')
+                ORDER BY tc.TABLE_SCHEMA, tc.TABLE_NAME, tc.CONSTRAINT_NAME, kcu.ORDINAL_POSITION;
+                """
+                try:
+                    cur.execute(kc_query, schema_args)
+                    kc_rows = cur.fetchall()
+                    key_constraints = [
+                        {
+                            "schema_name": r[0], "object_name": r[1], "constraint_name": r[2],
+                            "constraint_type": r[3], "key_ordinal": r[4], "column_name": r[5]
+                        }
+                        for r in kc_rows
+                    ]
+                except Exception:
+                    key_constraints = []
+
+                # 4. Foreign Keys
+                fk_filter = "kcu.TABLE_SCHEMA = %s" if db_target else "kcu.TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')"
+                fk_query = f"""
+                SELECT
+                    kcu.TABLE_SCHEMA AS schema_name,
+                    kcu.TABLE_NAME AS object_name,
+                    kcu.CONSTRAINT_NAME AS constraint_name,
+                    kcu.ORDINAL_POSITION AS ordinal,
+                    kcu.COLUMN_NAME AS column_name,
+                    kcu.REFERENCED_TABLE_SCHEMA AS referenced_schema,
+                    kcu.REFERENCED_TABLE_NAME AS referenced_object,
+                    kcu.REFERENCED_COLUMN_NAME AS referenced_column
+                FROM information_schema.KEY_COLUMN_USAGE kcu
+                JOIN information_schema.REFERENTIAL_CONSTRAINTS rc
+                  ON rc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+                 AND rc.CONSTRAINT_SCHEMA = kcu.TABLE_SCHEMA
+                WHERE {fk_filter}
+                  AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
+                ORDER BY kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION;
+                """
+                try:
+                    cur.execute(fk_query, schema_args)
+                    fk_rows = cur.fetchall()
+                    foreign_keys = [
+                        {
+                            "schema_name": r[0], "object_name": r[1], "constraint_name": r[2],
+                            "ordinal": r[3], "column_name": r[4], "referenced_schema": r[5],
+                            "referenced_object": r[6], "referenced_column": r[7]
+                        }
+                        for r in fk_rows
+                    ]
+                except Exception:
+                    foreign_keys = []
+
+                # 5. Table Statistics
+                stat_query = f"""
+                SELECT
+                    TABLE_SCHEMA AS schema_name,
+                    TABLE_NAME AS object_name,
+                    TABLE_ROWS AS approx_row_count
+                FROM information_schema.TABLES
+                WHERE {schema_filter} AND TABLE_TYPE = 'BASE TABLE';
+                """
+                try:
+                    cur.execute(stat_query, schema_args)
+                    stat_rows = cur.fetchall()
+                    table_stats = [
+                        {"schema_name": r[0], "object_name": r[1], "approx_row_count": r[2] or 0}
+                        for r in stat_rows
+                    ]
+                except Exception:
+                    table_stats = []
+
+            by: dict[tuple[str, str], list[dict[str, Any]]] = {(r["schema_name"], r["object_name"]): [] for r in objs}
+            for c in cols:
+                by.setdefault((c["schema_name"], c["object_name"]), []).append({
+                    "name": c["column_name"],
+                    "ordinal": c["column_id"],
+                    "type": c["declared_data_type"] or c["system_data_type"],
+                    "declared_type": c["declared_data_type"],
+                    "system_type": c["system_data_type"],
+                    "is_user_defined": bool(c["is_user_defined"]),
+                    "max_length": c["max_length"],
+                    "precision": c["precision"],
+                    "scale": c["scale"],
+                    "nullable": bool(c["is_nullable"]),
+                    "identity": bool(c["is_identity"]),
+                    "computed": bool(c["is_computed"]),
+                    "default": c["default_definition"],
+                    "collation": c["collation_name"],
+                })
+
+            constraint_by: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            grouped_keys: dict[tuple[str, str, str], dict[str, Any]] = {}
+            for k in key_constraints:
+                key = (k["schema_name"], k["object_name"], k["constraint_name"])
+                row = grouped_keys.setdefault(key, {
+                    "name": k["constraint_name"],
+                    "type": "PRIMARY_KEY" if str(k["constraint_type"]).upper().startswith("PRIMARY") else "UNIQUE",
+                    "columns": [],
+                })
+                row["columns"].append(k["column_name"])
+            for (sch, obj, _), row in grouped_keys.items():
+                constraint_by.setdefault((sch, obj), []).append(row)
+
+            grouped_fks: dict[tuple[str, str, str], dict[str, Any]] = {}
+            for f in foreign_keys:
+                key = (f["schema_name"], f["object_name"], f["constraint_name"])
+                row = grouped_fks.setdefault(key, {
+                    "name": f["constraint_name"], "type": "FOREIGN_KEY", "columns": [],
+                    "referenced_schema": f["referenced_schema"], "referenced_object": f["referenced_object"],
+                    "referenced_columns": [],
+                })
+                row["columns"].append(f["column_name"])
+                row["referenced_columns"].append(f["referenced_column"])
+            for (sch, obj, _), row in grouped_fks.items():
+                constraint_by.setdefault((sch, obj), []).append(row)
+
+            stats_by = {(r["schema_name"], r["object_name"]): int(r["approx_row_count"] or 0) for r in table_stats}
+
+            # 6. Dependencies from Foreign Keys and Views
+            dep_by: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            for f in foreign_keys:
+                dep_by.setdefault((f["schema_name"], f["object_name"]), []).append({
+                    "server": None,
+                    "database": f["referenced_schema"],
+                    "schema": f["referenced_schema"],
+                    "object": f["referenced_object"],
+                    "column": f["referenced_column"],
+                    "referenced_minor_id": None,
+                    "type": "FOREIGN_KEY",
+                    "is_schema_bound_reference": True,
+                    "is_caller_dependent": False,
+                    "is_ambiguous": False,
+                })
+
+            view_dep_query = f"""
+            SELECT
+                VIEW_SCHEMA AS referencing_schema_name,
+                VIEW_NAME AS referencing_entity_name,
+                TABLE_SCHEMA AS referenced_schema_name,
+                TABLE_NAME AS referenced_entity_name
+            FROM information_schema.VIEW_TABLE_USAGE
+            WHERE {schema_filter};
+            """
+            try:
+                cur.execute(view_dep_query, schema_args)
+                view_dep_rows = cur.fetchall()
+                for v in view_dep_rows:
+                    dep_by.setdefault((v[0], v[1]), []).append({
+                        "server": None,
+                        "database": v[2],
+                        "schema": v[2],
+                        "object": v[3],
+                        "column": None,
+                        "referenced_minor_id": None,
+                        "type": "VIEW_USAGE",
+                        "is_schema_bound_reference": True,
+                        "is_caller_dependent": False,
+                        "is_ambiguous": False,
+                    })
+            except Exception:
+                pass
+
+            # Also parse view/routine definitions for table references
+            table_names_set = {r["object_name"].lower() for r in objs if r["object_type"] == "TABLE"}
+            for r in objs:
+                if r["object_type"] in {"VIEW", "PROCEDURE", "FUNCTION"} and r.get("definition"):
+                    defn = (r["definition"] or "").lower()
+                    existing_refs = {d["object"].lower() for d in dep_by.get((r["schema_name"], r["object_name"]), [])}
+                    for tname in table_names_set:
+                        if tname != r["object_name"].lower() and tname not in existing_refs and re.search(r'\b' + re.escape(tname) + r'\b', defn):
+                            dep_by.setdefault((r["schema_name"], r["object_name"]), []).append({
+                                "server": None,
+                                "database": r["database_name"],
+                                "schema": r["schema_name"],
+                                "object": tname,
+                                "column": None,
+                                "referenced_minor_id": None,
+                                "type": "SQL_REFERENCE",
+                                "is_schema_bound_reference": True,
+                                "is_caller_dependent": False,
+                                "is_ambiguous": False,
+                            })
+
+            return {
+                "database": db_target or (objs[0]["database_name"] if objs else ""),
+                "objects": [{
+                    "database": r["database_name"],
+                    "schema": r["schema_name"],
+                    "name": r["object_name"],
+                    "type": r["object_type"],
+                    "definition": r["definition"],
+                    "columns": by.get((r["schema_name"], r["object_name"]), []),
+                    "dependencies": dep_by.get((r["schema_name"], r["object_name"]), []),
+                    "parameters": [],
+                    "constraints": constraint_by.get((r["schema_name"], r["object_name"]), []),
+                    "approx_row_count": stats_by.get((r["schema_name"], r["object_name"]))
+                } for r in objs]
+            }
+        finally:
+            conn.close()
+    except Exception as e:
+        raise RuntimeError(connection_diagnostic(e)) from e
+
+
+# ==============================================================================
+# POSTGRESQL DISCOVERY IMPLEMENTATION
+# ==============================================================================
 
 def parse_postgres_conn(conn_info: Any) -> dict:
     if isinstance(conn_info, dict):
@@ -306,10 +751,6 @@ def parse_postgres_conn(conn_info: Any) -> dict:
             out[k.strip()] = v.strip()
     return out
 
-
-# ==============================================================================
-# POSTGRESQL DISCOVERY IMPLEMENTATION
-# ==============================================================================
 
 def test_postgres_connection(conn_info: Any) -> dict[str, Any]:
     try:
@@ -637,14 +1078,21 @@ def discover_sqlserver(connection_string: str) -> dict[str, Any]:
         raise RuntimeError(connection_diagnostic(e)) from e
 
 
-def test_source_connection(conn_info: Any, source_type: str = "POSTGRESQL") -> dict[str, Any]:
-    if source_type.upper() == "POSTGRESQL":
+def test_source_connection(conn_info: Any, source_type: str = "MYSQL") -> dict[str, Any]:
+    st = (source_type or "MYSQL").upper()
+    if st == "MYSQL":
+        return test_mysql_connection(conn_info)
+    elif st in {"POSTGRESQL", "POSTGRES"}:
         return test_postgres_connection(conn_info)
     return test_sqlserver_connection(conn_info)
 
 
-def discover_source(conn_info: Any, source_type: str = "POSTGRESQL") -> dict[str, Any]:
-    if source_type.upper() == "POSTGRESQL":
+def discover_source(conn_info: Any, source_type: str = "MYSQL") -> dict[str, Any]:
+    st = (source_type or "MYSQL").upper()
+    if st == "MYSQL":
+        return discover_mysql(conn_info)
+    elif st in {"POSTGRESQL", "POSTGRES"}:
         return discover_postgres(conn_info)
     return discover_sqlserver(conn_info)
+
 
