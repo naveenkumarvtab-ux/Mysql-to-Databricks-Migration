@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: sql-server-to-databricks-migration
+    name: mysql-to-databricks-migration
     runtime: docker
     plan: free
     region: singapore
@@ -23,7 +23,19 @@ services:
       - key: ALLOWED_ORIGINS
         value: "*"
       - key: SOURCE_TYPE
-        value: POSTGRESQL
+        value: MYSQL
+      - key: MYSQL_HOST
+        sync: false
+      - key: MYSQL_PORT
+        value: "3306"
+      - key: MYSQL_DATABASE
+        sync: false
+      - key: MYSQL_USERNAME
+        value: root
+      - key: MYSQL_PASSWORD
+        sync: false
+      - key: MYSQL_SSL_MODE
+        value: DISABLED
       - key: POSTGRES_HOST
         sync: false
       - key: POSTGRES_PORT
