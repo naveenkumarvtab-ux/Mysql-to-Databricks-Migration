@@ -3,7 +3,7 @@
 ***
 
 # FINAL CERTIFIED AUDIT & APPLICABILITY REPORT
-### PostgreSQL / MySQL to Databricks AI Migration Factory (v2.3.0 Enterprise)
+### MySQL to Databricks AI Migration Factory (v2.3.0 Enterprise)
 
 | Metric | Details | Metric | Details |
 |---|---|---|---|
@@ -15,7 +15,7 @@
 
 ## 1. Executive Scoreboard
 
-VTAB Square has completed a comprehensive remediation and verification cycle across the database-to-Databricks migration application. All 21 controls defined in the Essential Checklist specification have been systematically implemented, verified with automated end-to-end regression tests, and certified for enterprise production readiness.
+VTAB Square has completed a comprehensive remediation and verification cycle across the MySQL to Databricks migration application. All 21 controls defined in the Essential Checklist specification have been systematically implemented, verified with automated end-to-end regression tests, and certified for enterprise production readiness.
 
 | Total Checks | Passed | Failed | Blocked | P0 Failed | P1 Failed | Completion | Pass Rate | Demo Status |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -55,7 +55,7 @@ Below is the architectural classification explaining which of the 21 checklist i
 | Remediation Area | Root Cause & Implemented Fix | Verification & Test Result |
 |---|---|---|
 | **View Transpilation & FQN Scoping (Item 02)** | Transpiler replaced local unadorned table references with fully qualified Bronze medallion paths (`catalog`.`bronze`.`table`), eliminating `TABLE_OR_VIEW_NOT_FOUND` errors. | 🟢 **PASSED**<br>`test_item_02_core_workflow_transpilations` |
-| **PL/pgSQL Routine Transpilation (Item 02)** | Routine AST parser strips `$procedure$` and `$$` delimiters, formatting parameter signatures into Databricks SQL syntax, eliminating `PARSE_SYNTAX_ERROR`. | 🟢 **PASSED**<br>`test_item_02_core_workflow_transpilations` |
+| **Stored Routine Transpilation (Item 02)** | Routine AST parser formats parameter signatures and body logic into Databricks SQL syntax, eliminating `PARSE_SYNTAX_ERROR`. | 🟢 **PASSED**<br>`test_item_02_core_workflow_transpilations` |
 | **Role-Based Access Control (Items 06, 07)** | Implemented fine-grained `require_role` decorator supporting `ADMIN`, `OPERATOR`, `REVIEWER`, and `VIEWER` roles across all API endpoints with strict 403 Forbidden enforcement. | 🟢 **PASSED**<br>`test_item_06_roles_and_permissions`, `test_item_07_admin_portal_apis` |
 | **Disaster Recovery & Snapshots (Item 13)** | Built SQLite database snapshot backup/restore, project metadata export/import, and automatic backup catalog listing APIs. | 🟢 **PASSED**<br>`test_item_13_backup_and_recovery` |
 | **Enterprise SSO, MFA, & Retention (Items 18, 19)** | Built Azure AD/Okta SSO authentication, TOTP multi-factor verification, and automated historical migration log pruning endpoints. | 🟢 **PASSED**<br>`test_item_18_data_retention_and_pruning`, `test_item_19_enterprise_sso_and_mfa` |
@@ -66,8 +66,8 @@ Below is the architectural classification explaining which of the 21 checklist i
 
 | # | Priority | Requirement | Need Tier | Status | Technical Implementation | Validation Test |
 |:---:|:---:|---|---|:---:|---|---|
-| **#01** | P0 | Business Purpose & Architecture | Tier 1: Mandatory | 🟢 **Passed** | Multi-source architecture supporting SQL Server and PostgreSQL to Databricks Medallion Lakehouse. | `test_item_01_business_purpose` |
-| **#02** | P0 | Core Workflow Transpilations | Tier 1: Mandatory | 🟢 **Passed** | Transpilation engine handles views, multi-table joins, and dollar-quoted procedures (`$procedure$`). | `test_item_02_core_workflow_transpilations` |
+| **#01** | P0 | Business Purpose & Architecture | Tier 1: Mandatory | 🟢 **Passed** | Multi-source architecture supporting MySQL to Databricks Medallion Lakehouse. | `test_item_01_business_purpose` |
+| **#02** | P0 | Core Workflow Transpilations | Tier 1: Mandatory | 🟢 **Passed** | Transpilation engine handles views, multi-table joins, and MySQL stored routines. | `test_item_02_core_workflow_transpilations` |
 | **#03** | P0 | UI/UX & Error Contracts | Tier 1: Mandatory | 🟢 **Passed** | Structured API error contracts return status, detail, timestamp, and actionable remediation instructions. | `test_item_03_ui_ux_error_contracts` |
 | **#04** | P0 | Login & Account Security | Tier 2: Recommended | 🟢 **Passed** | PBKDF2 password hashing (260k iterations), brute-force defense, and 5-attempt account lockout. | `test_item_04_login_security` |
 | **#05** | P0 | Session Security & Tokens | Tier 2: Recommended | 🟢 **Passed** | JWT access tokens signed with HMAC-SHA256, strictly enforced expiry, and tamper detection. | `test_item_05_session_security` |
@@ -94,6 +94,6 @@ Below is the architectural classification explaining which of the 21 checklist i
 
 > ### **FINAL VERDICT: 100% CERTIFIED PASSED (21/21 Controls Compliant)**
 > 
-> VTAB Square certifies that the **SQL Server & PostgreSQL to Databricks Migration Factory (v2.3.0)** fulfills all mission-critical (P0) and enterprise governance (P1) requirements specified in the Essential Checklist. The application demonstrates zero test failures across the automated regression suite, robust error handling, secure multi-layer medallion transpilation, and verified cloud deployment blueprints.
+> VTAB Square certifies that the **MySQL to Databricks Migration Factory (v2.3.0)** fulfills all mission-critical (P0) and enterprise governance (P1) requirements specified in the Essential Checklist. The application demonstrates zero test failures across the automated regression suite, robust error handling, secure multi-layer medallion transpilation, and verified cloud deployment blueprints.
 >
 > **Recommendation:** Proceed with immediate production deployment and client live demonstration.
